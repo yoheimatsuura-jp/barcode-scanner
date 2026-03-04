@@ -51,17 +51,20 @@ const setStatus = (t, err=false) => {
 };
 
 let qr = null;
-let busy = false;
+
+// 起動フロー排他（startの多重起動防止）
+let starting = false;
+// スキャン成功後の多重遷移防止
+let finishing = false;
 
 // ズーム段階（UI増やさず、ダブルタップで切替）
 const ZOOM_LEVELS = [1.0, 1.8, 2.6];
 let zoomIndex = 0;
 
 // iOSの「前面固定」を崩すためのスイッチング設定
-const MAX_SWITCH_TRIES = 4;
-const FRONT_DETECT_DELAY_MS = 260;
+const MAX_SWITCH_TRIES = 4;          // 多すぎると遅いので上限
+const FRONT_DETECT_DELAY_MS = 260;   // 起動直後の判定待ち
 
-// iOS/Safari判定（Slack内ブラウザも含め概ね同じ挙動）
 function isIOSLike() {
   const ua = navigator.userAgent || "";
   const iOS = /iPhone|iPad|iPod/i.test(ua);
@@ -70,9 +73,9 @@ function isIOSLike() {
 }
 
 /* =========================================================
-   ✅ ここが重要：戻りを“必ず”実行する
-   - postMessage は試す（開き方によっては成功する）
-   - iOSは window.close() が効かないことが多いので、returnUrl に location.replace で戻る
+   ✅ ここが重要：戻りを“必ず”実行する（白画面/戻れない対策）
+   - postMessage は試す（開き方によっては成功）
+   - iOS/Slack内は window.close() が効かないことが多いので returnUrl に location.replace
 ========================================================= */
 function goBackByReturnUrl(code) {
   if (!returnUrl) return false;
@@ -81,8 +84,7 @@ function goBackByReturnUrl(code) {
     u.searchParams.set("tab", tab);
     u.searchParams.set("target", target);
     u.searchParams.set("code", code);
-    // 履歴に残さない（戻る→またスキャナ、みたいなループ防止）
-    location.replace(u.toString());
+    location.replace(u.toString()); // 履歴に残さない
     return true;
   } catch (_) {
     return false;
@@ -92,24 +94,20 @@ function goBackByReturnUrl(code) {
 function sendResult(code) {
   const payload = { type:"barcode", code, target, tab };
 
-  // 1) opener がある場合は postMessage（成功することもある）
+  // 1) opener がある場合：postMessage → close（効けばラッキー）→ 念の為returnUrl
   if (window.opener) {
     try {
       window.opener.postMessage(payload, returnOrigin);
-      // close は効けばラッキー程度（iOSだと効かないことが多い）
       try { window.close(); } catch(_) {}
-      // ✅ それでも残った場合に備えて returnUrl へ戻す（保険）
       setTimeout(() => { goBackByReturnUrl(code); }, 50);
       return;
-    } catch(_) {
-      // 失敗したら returnUrl にフォールバック
-    }
+    } catch(_) {}
   }
 
-  // 2) 同タブ起動（iOS/Slack内）で opener が無い場合は returnUrl へ戻る
+  // 2) opener が無い/効かない：returnUrl に戻る（最重要）
   if (goBackByReturnUrl(code)) return;
 
-  // 3) それも無理なら最終フォールバック
+  // 3) 最後の保険
   alert("SCAN: " + code);
 }
 
@@ -178,6 +176,7 @@ async function getCamerasSafely() {
   try { return await Html5Qrcode.getCameras(); } catch (_) { return []; }
 }
 
+// iOSはlabelが空のことがあるので capability も併用して判定
 function isLikelyFrontCamera(track) {
   if (!track) return true;
 
@@ -188,18 +187,22 @@ function isLikelyFrontCamera(track) {
   const hasTorch = !!caps.torch;
   const hasZoom = !!(caps.zoom && (caps.zoom.max ?? 1) > 1.01);
 
+  // 背面の強い特徴（torch/zoomがあれば背面寄り）
   if (hasTorch || hasZoom) return false;
 
+  // ラベル判定（取れるときだけ）
   const frontHit = /front|user|selfie|前面|イン/i.test(l);
   const backHit  = /back|rear|environment|wide|ultra|tele|背面|リア|後/i.test(l);
 
   if (backHit) return false;
   if (frontHit) return true;
 
+  // 判断不能なら「前面かも」と扱ってスイッチを試す
   return true;
 }
 
 async function startHtml5(cameraConfig) {
+  // 前回の固定化を切るため毎回作り直す
   try { if (qr) await stop(); } catch(_) {}
   qr = new Html5Qrcode("reader", { verbose:false });
 
@@ -220,29 +223,25 @@ async function startHtml5(cameraConfig) {
     async (decodedText) => {
       const code = String(decodedText || "").trim();
       if (!code) return;
+      if (finishing) return; // 多重発火防止
+      finishing = true;
 
       setStatus("JANコード読み取り成功: " + code);
 
-      // ✅ 連続発火を止める（フリーズ/多重遷移対策）
-      if (busy) return;
-      busy = true;
-
-      try {
-        await stop();
-      } catch(_) {}
-
-      // ✅ ここで戻り処理
+      try { await stop(); } catch(_) {}
       sendResult(code);
     },
     () => {}
   );
 }
 
+// 「候補カメラ群」を作る：deviceId列 → 最後にenvironment
 function buildCandidateConfigs(cameraIds) {
   const configs = [];
   for (const id of cameraIds) {
+    // html5-qrcodeの制限：cameraIdOrConfig を object で渡すなら keyは1つだけ
     configs.push({ deviceId: { exact: id } });
-    configs.push({ deviceId: id });
+    configs.push({ deviceId: id }); // ideal的に効くことがある
   }
   configs.push({ facingMode: "environment" });
   return configs;
@@ -252,6 +251,7 @@ async function startWithAutoSwitch() {
   const cams = await getCamerasSafely();
   if (!cams.length) throw new Error("no cameras");
 
+  // まずは「背面っぽい順」に並べる：labelにback系が含まれるものを優先
   const sorted = [...cams].sort((a,b) => {
     const al = (a.label||"").toLowerCase();
     const bl = (b.label||"").toLowerCase();
@@ -276,14 +276,17 @@ async function startWithAutoSwitch() {
     try {
       await startHtml5(cfg);
 
+      // 起動後判定
       await new Promise(r => setTimeout(r, FRONT_DETECT_DELAY_MS));
       const track = getActiveVideoTrack();
 
       if (isLikelyFrontCamera(track)) {
+        // 前面濃厚 → 次へ
         try { await stop(); } catch(_) {}
         continue;
       }
 
+      // 背面っぽい → ここで確定、調整適用
       await applyEnhancements();
       setStatus("バーコードを枠内に合わせてください（ダブルタップでズーム切替）");
       return;
@@ -294,6 +297,7 @@ async function startWithAutoSwitch() {
     }
   }
 
+  // ここまで来たら「切替が効かない環境」なので、とりあえずenvironmentで起動を試す
   setStatus("背面固定に失敗。environmentで起動します…", true);
   await startHtml5({ facingMode: "environment" });
   await new Promise(r => setTimeout(r, FRONT_DETECT_DELAY_MS));
@@ -302,8 +306,9 @@ async function startWithAutoSwitch() {
 }
 
 async function start() {
-  if (busy) return;
-  busy = true;
+  if (starting) return;
+  starting = true;
+  finishing = false;
 
   try {
     if (!window.isSecureContext) {
@@ -324,18 +329,20 @@ async function start() {
       true
     );
   } finally {
-    // start中はbusyを戻す（スキャン成功時はsendResultで遷移するのでOK）
-    busy = false;
+    // ✅ startの多重起動だけ解除（背面探索自体は startWithAutoSwitch 内で完結）
+    starting = false;
   }
 }
 
-document.getElementById("retry").addEventListener("click", () => {
-  // 再試行はbusy解除してから
-  busy = false;
+document.getElementById("retry").addEventListener("click", async () => {
+  // 再試行は停止してから
+  finishing = false;
+  try { await stop(); } catch(_) {}
   start();
 });
 
 document.getElementById("cancel").addEventListener("click", async () => {
+  finishing = true;
   await stop();
   // iOSは閉じられないことが多いので、returnUrlがあれば戻す
   if (returnUrl) {
