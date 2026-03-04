@@ -20,7 +20,7 @@ video { filter: contrast(1.45) brightness(1.12); }
 </head>
 
 <body>
-<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-09</div>
+<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-10</div>
 <div id="reader"></div>
 <div class="p" id="status">起動中…</div>
 
@@ -54,9 +54,8 @@ let busy = false;
 let done = false;
 let lastAcceptedAt = 0;
 
-// カメラ候補を保持して「再試行」で循環
 let cameraList = [];
-let cameraIndex = 0;
+let cameraIndex = 0; // 0..len-1
 
 function onlyDigits(s){ return /^[0-9]+$/.test(s); }
 
@@ -80,7 +79,6 @@ function eanChecksumOK(code) {
 function normalizeCode(decodedText) {
   return String(decodedText || "").trim().replace(/\D/g, "");
 }
-
 function isValidJan(code) {
   if (!(code.length === 13 || code.length === 8)) return false;
   return eanChecksumOK(code);
@@ -130,53 +128,61 @@ async function hardFinishAndReturn(code) {
 
 function lower(s){ return String(s || "").toLowerCase(); }
 
-// 背面らしさで並べ替え（ラベルが空でも後ろの方を優先）
+// 背面っぽいラベルを優先。ラベルが空の場合も「後ろの方」を少し優先。
 function orderPreferBack(cams) {
   const keys = ["back","rear","environment","背面","アウト","外側"];
-  return cams
+  return (cams || [])
     .map((c, i) => {
       const l = lower(c.label);
-      let s = 0;
-      for (const k of keys) if (l.includes(k)) s += 100;
-      s += i; // 後ろにあるほど少し有利
-      return { c, s };
+      let score = 0;
+      for (const k of keys) if (l.includes(k)) score += 100;
+      score += i; // 後ろほどわずかに有利
+      return { c, score };
     })
-    .sort((a,b) => b.s - a.s)
+    .sort((a,b) => b.score - a.score)
     .map(x => x.c);
 }
 
-// いま掴んでいるカメラが内カメっぽいか判定（取れない環境もある）
-function isFrontCameraNow() {
+// ✅ iOS/WKWebView で label/複数カメラ列挙を安定させるために、先に許可を確定させる
+async function preflightPermission() {
+  if (!navigator.mediaDevices?.getUserMedia) return;
+  let stream = null;
   try {
-    const video = document.querySelector("#reader video");
-    const track = video?.srcObject?.getVideoTracks?.()[0];
-    if (!track) return false;
-
-    const settings = track.getSettings ? track.getSettings() : {};
-    const facing = lower(settings.facingMode);
-    const label = lower(track.label);
-
-    if (facing === "user") return true;
-    if (facing === "environment") return false;
-
-    if (label.includes("front") || label.includes("user") || label.includes("内") || label.includes("前面")) return true;
-    if (label.includes("back") || label.includes("rear") || label.includes("environment") || label.includes("背面")) return false;
-
-    return false; // 判定不能は「前と断定しない」
-  } catch(_) {
-    return false;
+    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+  } finally {
+    try {
+      stream?.getTracks?.().forEach(t => t.stop());
+    } catch(_) {}
   }
+}
+
+function diagLine(extra="") {
+  const ua = navigator.userAgent || "";
+  const inSlack = /Slack/i.test(ua);
+  const camCount = cameraList.length;
+  const idx = camCount ? (cameraIndex % camCount) + 1 : 0;
+  return `\n[diag] cams=${camCount} use=${idx}/${camCount} inSlack=${inSlack}${extra ? " " + extra : ""}`;
+}
+
+async function ensureCameraList() {
+  // 1) 許可確定 → 2) getCameras
+  await preflightPermission();
+  const cams = await Html5Qrcode.getCameras();
+  cameraList = orderPreferBack(cams);
+  if (!cameraList.length) return;
+
+  // indexが範囲外になってたら正規化
+  cameraIndex = cameraIndex % cameraList.length;
 }
 
 async function startWithCameraId(cameraId) {
   await qr.start(
-    cameraId, // ✅deviceId文字列で指定（iOSで強い）
+    cameraId, // deviceId string
     {
       fps: 10,
       qrbox: { width: 320, height: 80 },
       formatsToSupport: formats,
       disableFlip: false,
-      // videoConstraintsは入れてOK（deviceId指定と衝突しない）
       videoConstraints: { width: { ideal: 1920 }, height: { ideal: 1080 } }
     },
     async (decodedText) => {
@@ -191,20 +197,14 @@ async function startWithCameraId(cameraId) {
       done = true;
       lastAcceptedAt = now;
 
-      setStatus("JANコード読み取り成功: " + code);
+      setStatus("JANコード読み取り成功: " + code + diagLine());
       await hardFinishAndReturn(code);
     },
     () => {}
   );
 }
 
-async function ensureCameraList() {
-  const cams = await Html5Qrcode.getCameras();
-  cameraList = orderPreferBack(cams || []);
-  cameraIndex = 0;
-}
-
-async function startSmart(preferBack = true) {
+async function startSmart() {
   if (busy) return;
   busy = true;
   done = false;
@@ -222,53 +222,36 @@ async function startSmart(preferBack = true) {
 
     await ensureCameraList();
     if (!cameraList.length) {
-      setStatus("カメラが見つかりませんでした（権限/端末を確認）", true);
+      setStatus("カメラ候補を取得できませんでした。\n・iPhoneの設定でカメラ許可を確認\n・一度ページをリロード\n" + diagLine(), true);
       return;
     }
 
-    // ✅ まず背面候補から試す。内カメっぽければ次へ（最大2回）
-    const tries = Math.min(2, cameraList.length);
-    for (let i = 0; i < tries; i++) {
-      await stopWithTimeout(800);
-      const cam = cameraList[cameraIndex % cameraList.length];
-      setStatus(`カメラ起動中…（候補${cameraIndex+1}/${cameraList.length}）`);
-      await startWithCameraId(cam.id);
+    const cam = cameraList[cameraIndex % cameraList.length];
+    const labelHint = cam.label ? ` label=${cam.label}` : "";
+    setStatus("カメラ起動中…" + diagLine(labelHint));
 
-      // 少し待って内カメ判定
-      await new Promise(r => setTimeout(r, 600));
+    await startWithCameraId(cam.id);
 
-      if (preferBack && isFrontCameraNow() && cameraList.length > 1) {
-        cameraIndex++; // 次へ
-        continue;
-      }
-      setStatus("バーコードを枠内に合わせてください\n（内カメなら「再試行」で切替）");
-      return;
-    }
-
-    // ここまで来たら判定不能/固定など。とりあえず起動済み
-    setStatus("バーコードを枠内に合わせてください\n（内カメなら「再試行」で切替）");
+    setStatus(
+      "バーコードを枠内に合わせてください\n" +
+      "※内カメのままなら「再試行」を押してください" +
+      diagLine(labelHint)
+    );
 
   } catch(e) {
     const name = (e && e.name) || "Error";
     const msg  = (e && e.message) || String(e);
-    setStatus(
-      "起動失敗: " + name + " / " + msg +
-      "\n・Safariのカメラ許可がONか確認" +
-      "\n・他アプリでカメラ使用中だと失敗します",
-      true
-    );
+    setStatus("起動失敗: " + name + " / " + msg + diagLine(), true);
   } finally {
     busy = false;
   }
 }
 
-// ✅ 再試行：カメラを1つ進めて起動し直す（ユーザー操作起点）
+// ✅ 再試行：候補を進めて起動し直す
 document.getElementById("retry").addEventListener("click", async () => {
   if (busy) return;
-  try {
-    cameraIndex++;
-    await startSmart(false); // 判定で戻さず、次候補をそのまま使う
-  } catch(_) {}
+  cameraIndex++;
+  await startSmart();
 });
 
 document.getElementById("cancel").addEventListener("click", async () => {
@@ -278,7 +261,7 @@ document.getElementById("cancel").addEventListener("click", async () => {
   if (returnUrl) location.href = returnUrl;
 });
 
-startSmart(true);
+startSmart();
 </script>
 </body>
 </html>
