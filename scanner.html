@@ -57,12 +57,12 @@ let busy = false;
 const ZOOM_LEVELS = [1.0, 1.8, 2.6];
 let zoomIndex = 0;
 
-// ===== 背面固定のための設定 =====
+// 起動後の判定待ち
 const FRONT_DETECT_DELAY_MS = 260;
 
 // ===== フリーズ監視（UI変更なし）=====
 const WATCHDOG_INTERVAL_MS = 1200;
-const WATCHDOG_STALL_LIMIT = 4; // 連続で止まったら再起動
+const WATCHDOG_STALL_LIMIT = 4; // 連続停止回数で再起動
 let watchdogTimer = null;
 let lastVideoTime = -1;
 let stallCount = 0;
@@ -120,6 +120,7 @@ async function applyEnhancements() {
   const caps = (track.getCapabilities && track.getCapabilities()) || {};
   const adv = [];
 
+  // zoom
   if (caps.zoom) {
     const z = ZOOM_LEVELS[zoomIndex] ?? 1.0;
     const min = caps.zoom.min ?? 1.0;
@@ -128,6 +129,7 @@ async function applyEnhancements() {
     try { await track.applyConstraints({ advanced: [{ zoom: clamped }] }); } catch(_) {}
   }
 
+  // focus/exposure (可能なら continuous)
   if (caps.focusMode && Array.isArray(caps.focusMode) && caps.focusMode.includes("continuous")) {
     adv.push({ focusMode: "continuous" });
   }
@@ -135,7 +137,7 @@ async function applyEnhancements() {
     adv.push({ exposureMode: "continuous" });
   }
   if (adv.length) {
-    try { await track.applyConstraints({ advanced: adv }); } catch(_) {}
+    try { await track.applyConstraints({ advanced: adv } }); } catch(_) {}
   }
 }
 
@@ -162,64 +164,30 @@ async function getCamerasSafely() {
 }
 
 /**
- * 背面候補のスコアリング（labelが取れないiOS対策：まず背面を確保してからgetCamerasを呼ぶ）
+ * iOS/Safari/WebView では label が空・deviceId が無視されることがある。
+ * そのため「実際に起動して capability(torch/zoom) で背面判定」する。
+ * 背面の強い根拠：torch or zoom-capability
  */
-function scoreCameraLabel(label) {
-  const l = (label || "").toLowerCase();
-  let s = 0;
+function isLikelyFrontCamera(track) {
+  if (!track) return true;
 
-  // 背面寄り
-  if (/back|rear|environment|wide|ultra|tele|背面|リア|後/i.test(l)) s += 50;
-  // 前面寄り
-  if (/front|user|selfie|前面|イン/i.test(l)) s -= 80;
+  const caps = (track.getCapabilities && track.getCapabilities()) || {};
+  const label = (track.label || "").toLowerCase();
 
-  // 何も情報が無い場合は0
-  return s;
-}
+  const hasTorch = !!caps.torch;
+  const hasZoom = !!(caps.zoom && (caps.zoom.max ?? 1) > 1.01);
 
-async function primePermissionForRear() {
-  // iOS/Safari/WebViewは「最初の許可」で前面が固定化されることがあるので、
-  // 先に "environment exact" で getUserMedia を要求して背面側で許可を取る。
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+  if (hasTorch || hasZoom) return false;
 
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: { exact: "environment" },
-        width:  { ideal: 1920 },
-        height: { ideal: 1080 }
-      },
-      audio: false
-    });
-    // すぐ止める（許可とlabel取得のためだけ）
-    stream.getTracks().forEach(t => { try { t.stop(); } catch(_) {} });
-  } catch(_) {
-    // exactが通らない環境もあるので無視（後段でdeviceId選択へ）
-  }
-}
+  if (/back|rear|environment|wide|ultra|tele|背面|リア|後/i.test(label)) return false;
+  if (/front|user|selfie|前面|イン/i.test(label)) return true;
 
-async function pickBestRearCameraId() {
-  // まず背面で権限を取り、labelが出る状態に寄せる
-  await primePermissionForRear();
-
-  const cams = await getCamerasSafely();
-  if (!cams.length) return null;
-
-  // labelスコアで背面らしいものを最優先
-  const ranked = [...cams]
-    .map(c => ({ id: c.id, label: c.label || "", score: scoreCameraLabel(c.label || "") }))
-    .sort((a,b) => b.score - a.score);
-
-  // scoreが高いもの（背面らしいもの）を採用、無ければ先頭
-  const best = ranked[0];
-  return best ? best.id : cams[0].id;
+  return true;
 }
 
 async function startHtml5(cameraConfig) {
-  // 前回の固定化を切るため毎回作り直す
   try { if (qr) await stop(); } catch(_) {}
   qr = new Html5Qrcode("reader", { verbose:false });
-
   lastCameraConfig = cameraConfig;
 
   await qr.start(
@@ -230,7 +198,7 @@ async function startHtml5(cameraConfig) {
       formatsToSupport: formats,
       aspectRatio: 1.777,
       disableFlip: true,
-      // ※ ここはhtml5-qrcodeがgetUserMediaに渡す制約
+      // getUserMedia へ渡す制約（ズームや露出とは別系）
       videoConstraints: {
         width:  { ideal: 1920 },
         height: { ideal: 1080 },
@@ -249,38 +217,39 @@ async function startHtml5(cameraConfig) {
   );
 }
 
+// ===== フリーズ監視 =====
 function startWatchdog() {
   stopWatchdog();
   lastVideoTime = -1;
   stallCount = 0;
 
   watchdogTimer = setInterval(async () => {
-    // スキャン中でないなら監視しない
     if (!qr || !qr.isScanning) return;
 
     const v = getVideoEl();
     if (!v) return;
 
-    // 表示が隠れている間は止まりやすいので、無理に再起動しない
+    // 背景化中は固まりやすいので再起動しない
     if (document.hidden) return;
 
     const t = v.currentTime || 0;
 
-    // currentTimeが進んでいない＝固まっている可能性
     if (lastVideoTime >= 0 && Math.abs(t - lastVideoTime) < 0.0001) {
       stallCount++;
       if (stallCount >= WATCHDOG_STALL_LIMIT) {
         stallCount = 0;
+
         setStatus("映像が停止したため再起動します…", true);
 
-        // 同じカメラで再起動（UIは変えない）
         const cfg = lastCameraConfig || { facingMode: "environment" };
         try { await stop(); } catch(_) {}
+
         try {
           await startHtml5(cfg);
           await new Promise(r => setTimeout(r, FRONT_DETECT_DELAY_MS));
           await applyEnhancements();
           setStatus("バーコードを枠内に合わせてください（ダブルタップでズーム切替）");
+          startWatchdog();
         } catch(e) {
           setStatus("再起動失敗: " + ((e && e.message) || e), true);
         }
@@ -300,14 +269,59 @@ function stopWatchdog() {
   }
 }
 
+/**
+ * 背面カメラ探索（実測）
+ * 各 deviceId を短時間起動 -> track capability で背面っぽいものを確定
+ */
+async function probeRearCameraId(cams) {
+  for (let i = 0; i < cams.length; i++) {
+    const cam = cams[i];
+    try {
+      setStatus(`背面探索中…（${i+1}/${cams.length}）`);
+      await startHtml5({ deviceId: { exact: cam.id } });
+
+      await new Promise(r => setTimeout(r, FRONT_DETECT_DELAY_MS));
+      const track = getActiveVideoTrack();
+
+      if (track && !isLikelyFrontCamera(track)) {
+        // 背面確定（ここでは stop せず、呼び出し側で確定起動し直す）
+        await stop();
+        return cam.id;
+      }
+
+      // 前面っぽい -> 次へ
+      await stop();
+
+    } catch (_) {
+      try { await stop(); } catch(_) {}
+      continue;
+    }
+  }
+  return null;
+}
+
 async function startWithRearFixed() {
   bindDoubleTapToZoom();
 
-  // 1) deviceIdで背面を固定（最優先）
-  const bestId = await pickBestRearCameraId();
-  if (bestId) {
+  const cams = await getCamerasSafely();
+  if (!cams.length) throw new Error("no cameras");
+
+  // labelが取れる環境なら背面っぽい順で探索効率UP
+  const sorted = [...cams].sort((a,b) => {
+    const al = (a.label||"").toLowerCase();
+    const bl = (b.label||"").toLowerCase();
+    const aBack = /back|rear|environment|wide|ultra|tele|背面|リア|後/i.test(al);
+    const bBack = /back|rear|environment|wide|ultra|tele|背面|リア|後/i.test(bl);
+    if (aBack === bBack) return 0;
+    return aBack ? -1 : 1;
+  });
+
+  // ★実測で背面IDを確定
+  const rearId = await probeRearCameraId(sorted);
+
+  if (rearId) {
     setStatus("背面カメラ起動中…");
-    await startHtml5({ deviceId: { exact: bestId } });
+    await startHtml5({ deviceId: { exact: rearId } });
     await new Promise(r => setTimeout(r, FRONT_DETECT_DELAY_MS));
     await applyEnhancements();
     setStatus("バーコードを枠内に合わせてください（ダブルタップでズーム切替）");
@@ -315,8 +329,8 @@ async function startWithRearFixed() {
     return;
   }
 
-  // 2) fallback: environment
-  setStatus("背面カメラ起動中…");
+  // 最後のフォールバック
+  setStatus("背面を特定できませんでした。environmentで起動します…", true);
   await startHtml5({ facingMode: "environment" });
   await new Promise(r => setTimeout(r, FRONT_DETECT_DELAY_MS));
   await applyEnhancements();
@@ -351,13 +365,12 @@ async function start() {
   }
 }
 
-// 画面が裏に回ったときの停止／復帰（WebViewフリーズ対策）
+// 画面裏に回ったときの停止／復帰（WebViewフリーズ対策）
 document.addEventListener("visibilitychange", async () => {
   try {
     if (document.hidden) {
       await stop();
     } else {
-      // ユーザーが閉じてないなら自動復帰
       await start();
     }
   } catch(_) {}
