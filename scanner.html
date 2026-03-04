@@ -22,7 +22,7 @@ video { filter: contrast(1.4) brightness(1.1); }
 </head>
 
 <body>
-<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-02</div>
+<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-03</div>
 <div id="reader"></div>
 <div class="p" id="status">起動中…</div>
 
@@ -46,7 +46,7 @@ const setStatus = (t, err=false) => {
   statusEl.className = "p" + (err ? " err" : "");
 };
 
-/* ===== JANコードのみ ===== */
+/* ===== JAN(EAN)優先 ===== */
 const formats = [
   Html5QrcodeSupportedFormats.EAN_13,
   Html5QrcodeSupportedFormats.EAN_8,
@@ -54,11 +54,53 @@ const formats = [
 
 let qr = null;
 let busy = false;
+let lastAcceptedAt = 0;
+
+function onlyDigits(s){ return /^[0-9]+$/.test(s); }
+
+function eanChecksumOK(code) {
+  // EAN-13 / EAN-8 check digit validation
+  if (!onlyDigits(code)) return false;
+
+  const len = code.length;
+  if (len !== 13 && len !== 8) return false;
+
+  const digits = code.split("").map(d => Number(d));
+  const check = digits[len - 1];
+  const body = digits.slice(0, len - 1);
+
+  // From rightmost of body: weights alternate 3 and 1
+  // EAN-13: sum odd/even positions depending on indexing; easiest: iterate from end
+  let sum = 0;
+  for (let i = body.length - 1, w3 = true; i >= 0; i--, w3 = !w3) {
+    sum += body[i] * (w3 ? 3 : 1);
+  }
+  const calc = (10 - (sum % 10)) % 10;
+  return calc === check;
+}
+
+function normalizeCode(decodedText) {
+  // html5-qrcode returns text; remove spaces and non-digits
+  const s = String(decodedText || "").trim();
+  // たまに "EAN_13:xxxx" 的な付与がある環境への保険
+  const digits = s.replace(/\D/g, "");
+  return digits;
+}
+
+function isValidJan(code) {
+  // EAN-13 or EAN-8 only + checksum OK
+  if (!(code.length === 13 || code.length === 8)) return false;
+  if (!eanChecksumOK(code)) return false;
+
+  // 日本JANだけに絞りたい場合はON（任意）
+  // if (code.length === 13 && !(code.startsWith("45") || code.startsWith("49"))) return false;
+
+  return true;
+}
 
 function sendResult(code) {
   const payload = { type:"barcode", code, target, tab };
 
-  // 1) opener があれば postMessage
   if (window.opener) {
     try {
       window.opener.postMessage(payload, returnOrigin);
@@ -67,7 +109,6 @@ function sendResult(code) {
     } catch(_) {}
   }
 
-  // 2) opener が無ければ returnUrl に code を付けて戻る
   if (returnUrl) {
     const u = new URL(returnUrl);
     u.searchParams.set("tab", tab);
@@ -90,13 +131,30 @@ function pickBackCamera(cameras) {
   const keywords = ["back","rear","environment","背面","アウト","外側"];
   const lower = (s) => String(s || "").toLowerCase();
 
-  // label から背面らしいものを優先
   for (const c of cameras) {
     const label = lower(c.label);
     if (keywords.some(k => label.includes(k))) return c;
   }
-  // ない場合は末尾を優先（背面が後ろに来やすい環境が多い）
   return cameras[cameras.length - 1] || cameras[0] || null;
+}
+
+// 可能ならズームを試す（効かない端末もある）
+async function tryApplyZoom(videoEl) {
+  try {
+    const track = videoEl && videoEl.srcObject && videoEl.srcObject.getVideoTracks
+      ? videoEl.srcObject.getVideoTracks()[0]
+      : null;
+    if (!track) return;
+
+    const caps = track.getCapabilities ? track.getCapabilities() : null;
+    if (!caps || !caps.zoom) return;
+
+    // ほどほどにズーム（最大が小さい端末もあるのでクランプ）
+    const max = caps.zoom.max;
+    const min = caps.zoom.min;
+    const target = Math.min(max, Math.max(min, (min + max) / 2)); // 中間
+    await track.applyConstraints({ advanced: [{ zoom: target }] });
+  } catch(_) {}
 }
 
 async function start() {
@@ -114,7 +172,6 @@ async function start() {
 
     setStatus("カメラ準備中…（許可ダイアログが出たら許可）");
 
-    // ✅ 重要：cameraIdOrConfig の object を使わず、カメラID文字列で start する
     const cameras = await Html5Qrcode.getCameras();
     if (!cameras || cameras.length === 0) {
       setStatus("カメラが見つかりませんでした（権限/デバイスを確認）", true);
@@ -130,18 +187,38 @@ async function start() {
     setStatus("カメラ起動中…（バーコードを枠内へ）");
 
     await qr.start(
-      cam.id, // ← 文字列IDなので「object should have exactly 1 key」系を根絶
+      cam.id,
       {
-        fps: 15,
-        qrbox: { width: 320, height: 140 }, // 横長（JAN最適）
+        // 読取安定寄り
+        fps: 10,
+
+        // ✅ 色付き/小さいバーコード対策：枠を少し小さめ＆横長に
+        qrbox: { width: 280, height: 120 },
+
+        // 可能ならEAN優先（端末によっては完全には効かない→後段のバリデーションで保証）
         formatsToSupport: formats,
-        aspectRatio: 1.777,
-        disableFlip: true
+
+        // 端末差があるので固定しすぎない
+        // aspectRatio: 1.777,
+
+        // flip は端末によって必要な場合がある
+        disableFlip: false
       },
       async (decodedText) => {
-        const code = String(decodedText || "").trim();
-        if (!code) return;
+        const now = Date.now();
+        // 連続発火抑制（誤爆/多重送信防止）
+        if (now - lastAcceptedAt < 800) return;
 
+        const code = normalizeCode(decodedText);
+
+        // ✅ QRなどJAN以外は “読めても捨てる”
+        if (!isValidJan(code)) {
+          // デバッグしたい場合だけ表示（普段はうるさいのでコメントアウト推奨）
+          // setStatus("JAN以外を検出（無視）: " + String(decodedText).slice(0, 40));
+          return;
+        }
+
+        lastAcceptedAt = now;
         setStatus("JANコード読み取り成功: " + code);
 
         // 読み取り後すぐ停止
@@ -150,6 +227,12 @@ async function start() {
       },
       () => {}
     );
+
+    // 起動後、video要素が生成されるのでズームを試す（効けば色付き/小型に強くなる）
+    setTimeout(() => {
+      const video = document.querySelector("#reader video");
+      tryApplyZoom(video);
+    }, 600);
 
     setStatus("バーコードを枠内に合わせてください");
 
