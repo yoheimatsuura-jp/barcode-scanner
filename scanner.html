@@ -15,14 +15,12 @@ button { border:0; border-radius:10px; padding:12px; font-weight:900; font-size:
 .pri { background:#0f766e; color:#fff; }
 .sub { background:#e5e7eb; color:#111827; }
 .err { color:#fecaca; }
-
-/* コントラスト強化（色付き背景対策） */
 video { filter: contrast(1.45) brightness(1.12); }
 </style>
 </head>
 
 <body>
-<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-04</div>
+<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-05</div>
 <div id="reader"></div>
 <div class="p" id="status">起動中…</div>
 
@@ -46,7 +44,6 @@ const setStatus = (t, err=false) => {
   statusEl.className = "p" + (err ? " err" : "");
 };
 
-/* ===== JAN(EAN)優先 ===== */
 const formats = [
   Html5QrcodeSupportedFormats.EAN_13,
   Html5QrcodeSupportedFormats.EAN_8,
@@ -55,6 +52,7 @@ const formats = [
 let qr = null;
 let busy = false;
 let lastAcceptedAt = 0;
+let done = false; // ✅ 成功処理を一度だけ
 
 function onlyDigits(s){ return /^[0-9]+$/.test(s); }
 
@@ -76,49 +74,76 @@ function eanChecksumOK(code) {
 }
 
 function normalizeCode(decodedText) {
-  const s = String(decodedText || "").trim();
-  return s.replace(/\D/g, "");
+  return String(decodedText || "").trim().replace(/\D/g, "");
 }
 
 function isValidJan(code) {
   if (!(code.length === 13 || code.length === 8)) return false;
-  if (!eanChecksumOK(code)) return false;
-  return true;
+  return eanChecksumOK(code);
 }
 
-function sendResult(code) {
+function buildReturnUrlWithCode(code) {
+  if (!returnUrl) return "";
+  const u = new URL(returnUrl);
+  u.searchParams.set("tab", tab);
+  u.searchParams.set("target", target);
+  u.searchParams.set("code", code);
+  return u.toString();
+}
+
+// ✅ stopがハングして白画面化するのを防ぐ（タイムアウト）
+async function stopWithTimeout(ms = 1200) {
+  if (!qr) return;
+  const timeout = new Promise((resolve) => setTimeout(resolve, ms));
+  const stopper = (async () => {
+    try { if (qr.isScanning) await qr.stop(); } catch(_) {}
+    try { await qr.clear(); } catch(_) {}
+  })();
+  await Promise.race([stopper, timeout]);
+}
+
+async function hardFinishAndReturn(code) {
+  // 画面が白く固まって見えないのを避けるため、完了メッセージを先に出す
+  setStatus("読み取り完了。戻ります…");
+
+  // まずカメラ停止（ハングしてもタイムアウトで抜ける）
+  await stopWithTimeout(1200);
+
   const payload = { type:"barcode", code, target, tab };
 
+  // openerがあるならpostMessage優先
   if (window.opener) {
     try {
       window.opener.postMessage(payload, returnOrigin);
-      window.close();
+      // closeは効かないことがあるので、ダメならreturnUrlへフォールバック
+      try { window.close(); } catch(_) {}
+      // closeできないケース対策：少し待ってまだ開いてたら遷移で戻す
+      setTimeout(() => {
+        if (returnUrl) location.href = buildReturnUrlWithCode(code);
+      }, 150);
       return;
-    } catch(_) {}
+    } catch(_) {
+      // postMessage失敗 → returnUrlへ
+      if (returnUrl) {
+        location.href = buildReturnUrlWithCode(code);
+        return;
+      }
+    }
   }
 
+  // openerなし → returnUrlへ
   if (returnUrl) {
-    const u = new URL(returnUrl);
-    u.searchParams.set("tab", tab);
-    u.searchParams.set("target", target);
-    u.searchParams.set("code", code);
-    location.href = u.toString();
+    location.href = buildReturnUrlWithCode(code);
     return;
   }
 
-  alert("SCAN: " + code);
-}
-
-async function stop() {
-  if (!qr) return;
-  try { if (qr.isScanning) await qr.stop(); } catch(_) {}
-  try { await qr.clear(); } catch(_) {}
+  // どうにもならない最終手段
+  setStatus("SCAN: " + code + "（戻り先が無いのでこの画面で終了）");
 }
 
 function pickBackCamera(cameras) {
   const keywords = ["back","rear","environment","背面","アウト","外側"];
   const lower = (s) => String(s || "").toLowerCase();
-
   for (const c of cameras) {
     const label = lower(c.label);
     if (keywords.some(k => label.includes(k))) return c;
@@ -137,21 +162,15 @@ async function tryApplyVideoTuning(videoEl) {
     if (!caps) return;
 
     const advanced = [];
-
-    // ✅ 可能なら連続AF（対応していない端末では無視される）
     if (caps.focusMode && Array.isArray(caps.focusMode) && caps.focusMode.includes("continuous")) {
       advanced.push({ focusMode: "continuous" });
     }
-
-    // ✅ 可能ならズーム（ピント合わない問題の現実的な救済）
     if (caps.zoom) {
       const min = caps.zoom.min;
       const max = caps.zoom.max;
-      // 中間より少し強め（近づかなくて良い距離に寄せる）
       const z = Math.min(max, Math.max(min, min + (max - min) * 0.70));
       advanced.push({ zoom: z });
     }
-
     if (advanced.length) {
       await track.applyConstraints({ advanced });
     }
@@ -161,6 +180,7 @@ async function tryApplyVideoTuning(videoEl) {
 async function start() {
   if (busy) return;
   busy = true;
+  done = false;
 
   try {
     if (!window.isSecureContext) {
@@ -169,7 +189,7 @@ async function start() {
     }
 
     if (!qr) qr = new Html5Qrcode("reader", { verbose:false });
-    await stop();
+    await stopWithTimeout(800);
 
     setStatus("カメラ準備中…（許可ダイアログが出たら許可）");
 
@@ -191,39 +211,33 @@ async function start() {
       cam.id,
       {
         fps: 10,
-
-        // ✅ ここが肝：バー以外（模様/色/線）が入りにくい “薄い横帯” にする
-        // 高さを小さくして「バー部分だけ」を切り出しやすくする
         qrbox: { width: 320, height: 80 },
-
         formatsToSupport: formats,
-
-        // flipは許可（端末によって必要）
         disableFlip: false,
-
-        // ✅ 可能な端末で解像度を上げる（細いバーに有利）
         videoConstraints: {
           width: { ideal: 1920 },
           height: { ideal: 1080 }
         }
       },
       async (decodedText) => {
+        if (done) return;
+
         const now = Date.now();
-        if (now - lastAcceptedAt < 800) return;
+        if (now - lastAcceptedAt < 900) return;
 
         const code = normalizeCode(decodedText);
         if (!isValidJan(code)) return;
 
+        // ✅ ここから先は一度だけ
+        done = true;
         lastAcceptedAt = now;
-        setStatus("JANコード読み取り成功: " + code);
 
-        await stop();
-        sendResult(code);
+        setStatus("JANコード読み取り成功: " + code);
+        await hardFinishAndReturn(code);
       },
       () => {}
     );
 
-    // 起動後にチューニング（ズーム/AF）
     setTimeout(() => {
       const video = document.querySelector("#reader video");
       tryApplyVideoTuning(video);
@@ -245,8 +259,9 @@ async function start() {
 
 document.getElementById("retry").addEventListener("click", start);
 document.getElementById("cancel").addEventListener("click", async () => {
-  await stop();
-  window.close();
+  done = true;
+  await stopWithTimeout(800);
+  try { window.close(); } catch(_) {}
   if (returnUrl) location.href = returnUrl;
 });
 
