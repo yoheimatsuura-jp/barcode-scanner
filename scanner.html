@@ -17,12 +17,12 @@ button { border:0; border-radius:10px; padding:12px; font-weight:900; font-size:
 .err { color:#fecaca; }
 
 /* コントラスト強化（色付き背景対策） */
-video { filter: contrast(1.4) brightness(1.1); }
+video { filter: contrast(1.45) brightness(1.12); }
 </style>
 </head>
 
 <body>
-<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-03</div>
+<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-04</div>
 <div id="reader"></div>
 <div class="p" id="status">起動中…</div>
 
@@ -59,9 +59,7 @@ let lastAcceptedAt = 0;
 function onlyDigits(s){ return /^[0-9]+$/.test(s); }
 
 function eanChecksumOK(code) {
-  // EAN-13 / EAN-8 check digit validation
   if (!onlyDigits(code)) return false;
-
   const len = code.length;
   if (len !== 13 && len !== 8) return false;
 
@@ -69,8 +67,6 @@ function eanChecksumOK(code) {
   const check = digits[len - 1];
   const body = digits.slice(0, len - 1);
 
-  // From rightmost of body: weights alternate 3 and 1
-  // EAN-13: sum odd/even positions depending on indexing; easiest: iterate from end
   let sum = 0;
   for (let i = body.length - 1, w3 = true; i >= 0; i--, w3 = !w3) {
     sum += body[i] * (w3 ? 3 : 1);
@@ -80,21 +76,13 @@ function eanChecksumOK(code) {
 }
 
 function normalizeCode(decodedText) {
-  // html5-qrcode returns text; remove spaces and non-digits
   const s = String(decodedText || "").trim();
-  // たまに "EAN_13:xxxx" 的な付与がある環境への保険
-  const digits = s.replace(/\D/g, "");
-  return digits;
+  return s.replace(/\D/g, "");
 }
 
 function isValidJan(code) {
-  // EAN-13 or EAN-8 only + checksum OK
   if (!(code.length === 13 || code.length === 8)) return false;
   if (!eanChecksumOK(code)) return false;
-
-  // 日本JANだけに絞りたい場合はON（任意）
-  // if (code.length === 13 && !(code.startsWith("45") || code.startsWith("49"))) return false;
-
   return true;
 }
 
@@ -138,8 +126,7 @@ function pickBackCamera(cameras) {
   return cameras[cameras.length - 1] || cameras[0] || null;
 }
 
-// 可能ならズームを試す（効かない端末もある）
-async function tryApplyZoom(videoEl) {
+async function tryApplyVideoTuning(videoEl) {
   try {
     const track = videoEl && videoEl.srcObject && videoEl.srcObject.getVideoTracks
       ? videoEl.srcObject.getVideoTracks()[0]
@@ -147,13 +134,27 @@ async function tryApplyZoom(videoEl) {
     if (!track) return;
 
     const caps = track.getCapabilities ? track.getCapabilities() : null;
-    if (!caps || !caps.zoom) return;
+    if (!caps) return;
 
-    // ほどほどにズーム（最大が小さい端末もあるのでクランプ）
-    const max = caps.zoom.max;
-    const min = caps.zoom.min;
-    const target = Math.min(max, Math.max(min, (min + max) / 2)); // 中間
-    await track.applyConstraints({ advanced: [{ zoom: target }] });
+    const advanced = [];
+
+    // ✅ 可能なら連続AF（対応していない端末では無視される）
+    if (caps.focusMode && Array.isArray(caps.focusMode) && caps.focusMode.includes("continuous")) {
+      advanced.push({ focusMode: "continuous" });
+    }
+
+    // ✅ 可能ならズーム（ピント合わない問題の現実的な救済）
+    if (caps.zoom) {
+      const min = caps.zoom.min;
+      const max = caps.zoom.max;
+      // 中間より少し強め（近づかなくて良い距離に寄せる）
+      const z = Math.min(max, Math.max(min, min + (max - min) * 0.70));
+      advanced.push({ zoom: z });
+    }
+
+    if (advanced.length) {
+      await track.applyConstraints({ advanced });
+    }
   } catch(_) {}
 }
 
@@ -189,50 +190,44 @@ async function start() {
     await qr.start(
       cam.id,
       {
-        // 読取安定寄り
         fps: 10,
 
-        // ✅ 色付き/小さいバーコード対策：枠を少し小さめ＆横長に
-        qrbox: { width: 280, height: 120 },
+        // ✅ ここが肝：バー以外（模様/色/線）が入りにくい “薄い横帯” にする
+        // 高さを小さくして「バー部分だけ」を切り出しやすくする
+        qrbox: { width: 320, height: 80 },
 
-        // 可能ならEAN優先（端末によっては完全には効かない→後段のバリデーションで保証）
         formatsToSupport: formats,
 
-        // 端末差があるので固定しすぎない
-        // aspectRatio: 1.777,
+        // flipは許可（端末によって必要）
+        disableFlip: false,
 
-        // flip は端末によって必要な場合がある
-        disableFlip: false
+        // ✅ 可能な端末で解像度を上げる（細いバーに有利）
+        videoConstraints: {
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        }
       },
       async (decodedText) => {
         const now = Date.now();
-        // 連続発火抑制（誤爆/多重送信防止）
         if (now - lastAcceptedAt < 800) return;
 
         const code = normalizeCode(decodedText);
-
-        // ✅ QRなどJAN以外は “読めても捨てる”
-        if (!isValidJan(code)) {
-          // デバッグしたい場合だけ表示（普段はうるさいのでコメントアウト推奨）
-          // setStatus("JAN以外を検出（無視）: " + String(decodedText).slice(0, 40));
-          return;
-        }
+        if (!isValidJan(code)) return;
 
         lastAcceptedAt = now;
         setStatus("JANコード読み取り成功: " + code);
 
-        // 読み取り後すぐ停止
         await stop();
         sendResult(code);
       },
       () => {}
     );
 
-    // 起動後、video要素が生成されるのでズームを試す（効けば色付き/小型に強くなる）
+    // 起動後にチューニング（ズーム/AF）
     setTimeout(() => {
       const video = document.querySelector("#reader video");
-      tryApplyZoom(video);
-    }, 600);
+      tryApplyVideoTuning(video);
+    }, 700);
 
     setStatus("バーコードを枠内に合わせてください");
 
