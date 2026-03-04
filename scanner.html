@@ -15,12 +15,12 @@ button { border:0; border-radius:10px; padding:12px; font-weight:900; font-size:
 .pri { background:#0f766e; color:#fff; }
 .sub { background:#e5e7eb; color:#111827; }
 .err { color:#fecaca; }
-video { filter: contrast(1.55) brightness(1.10) saturate(1.05); }
+video { filter: contrast(1.45) brightness(1.12); }
 </style>
 </head>
 
 <body>
-<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-13</div>
+<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-05</div>
 <div id="reader"></div>
 <div class="p" id="status">起動中…</div>
 
@@ -38,277 +38,149 @@ const tab = qs.get("tab") || "";
 const returnOrigin = qs.get("returnOrigin") || "*";
 const returnUrl = qs.get("returnUrl") || "";
 
-/* ===== JANコードのみ ===== */
-const formats = [
-  Html5QrcodeSupportedFormats.EAN_13,
-  Html5QrcodeSupportedFormats.EAN_8,
-];
-
 const statusEl = document.getElementById("status");
 const setStatus = (t, err=false) => {
   statusEl.textContent = t;
   statusEl.className = "p" + (err ? " err" : "");
 };
 
+const formats = [
+  Html5QrcodeSupportedFormats.EAN_13,
+  Html5QrcodeSupportedFormats.EAN_8,
+];
+
 let qr = null;
+let busy = false;
+let lastAcceptedAt = 0;
+let done = false; // ✅ 成功処理を一度だけ
 
-// 起動フロー排他（startの多重起動防止）
-let starting = false;
-// スキャン成功後の多重遷移防止
-let finishing = false;
+function onlyDigits(s){ return /^[0-9]+$/.test(s); }
 
-// ズーム段階（UI増やさず、ダブルタップで切替）
-const ZOOM_LEVELS = [1.0, 1.8, 2.6];
-let zoomIndex = 0;
+function eanChecksumOK(code) {
+  if (!onlyDigits(code)) return false;
+  const len = code.length;
+  if (len !== 13 && len !== 8) return false;
 
-// iOSの「前面固定」を崩すためのスイッチング設定
-const MAX_SWITCH_TRIES = 4;          // 多すぎると遅いので上限
-const FRONT_DETECT_DELAY_MS = 260;   // 起動直後の判定待ち
+  const digits = code.split("").map(d => Number(d));
+  const check = digits[len - 1];
+  const body = digits.slice(0, len - 1);
 
-function isIOSLike() {
-  const ua = navigator.userAgent || "";
-  const iOS = /iPhone|iPad|iPod/i.test(ua);
-  const iPadOS = navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
-  return iOS || iPadOS;
-}
-
-/* =========================================================
-   ✅ ここが重要：戻りを“必ず”実行する（白画面/戻れない対策）
-   - postMessage は試す（開き方によっては成功）
-   - iOS/Slack内は window.close() が効かないことが多いので returnUrl に location.replace
-========================================================= */
-function goBackByReturnUrl(code) {
-  if (!returnUrl) return false;
-  try {
-    const u = new URL(returnUrl);
-    u.searchParams.set("tab", tab);
-    u.searchParams.set("target", target);
-    u.searchParams.set("code", code);
-    location.replace(u.toString()); // 履歴に残さない
-    return true;
-  } catch (_) {
-    return false;
+  let sum = 0;
+  for (let i = body.length - 1, w3 = true; i >= 0; i--, w3 = !w3) {
+    sum += body[i] * (w3 ? 3 : 1);
   }
+  const calc = (10 - (sum % 10)) % 10;
+  return calc === check;
 }
 
-function sendResult(code) {
+function normalizeCode(decodedText) {
+  return String(decodedText || "").trim().replace(/\D/g, "");
+}
+
+function isValidJan(code) {
+  if (!(code.length === 13 || code.length === 8)) return false;
+  return eanChecksumOK(code);
+}
+
+function buildReturnUrlWithCode(code) {
+  if (!returnUrl) return "";
+  const u = new URL(returnUrl);
+  u.searchParams.set("tab", tab);
+  u.searchParams.set("target", target);
+  u.searchParams.set("code", code);
+  return u.toString();
+}
+
+// ✅ stopがハングして白画面化するのを防ぐ（タイムアウト）
+async function stopWithTimeout(ms = 1200) {
+  if (!qr) return;
+  const timeout = new Promise((resolve) => setTimeout(resolve, ms));
+  const stopper = (async () => {
+    try { if (qr.isScanning) await qr.stop(); } catch(_) {}
+    try { await qr.clear(); } catch(_) {}
+  })();
+  await Promise.race([stopper, timeout]);
+}
+
+async function hardFinishAndReturn(code) {
+  // 画面が白く固まって見えないのを避けるため、完了メッセージを先に出す
+  setStatus("読み取り完了。戻ります…");
+
+  // まずカメラ停止（ハングしてもタイムアウトで抜ける）
+  await stopWithTimeout(1200);
+
   const payload = { type:"barcode", code, target, tab };
 
-  // 1) opener がある場合：postMessage → close（効けばラッキー）→ 念の為returnUrl
+  // openerがあるならpostMessage優先
   if (window.opener) {
     try {
       window.opener.postMessage(payload, returnOrigin);
+      // closeは効かないことがあるので、ダメならreturnUrlへフォールバック
       try { window.close(); } catch(_) {}
-      setTimeout(() => { goBackByReturnUrl(code); }, 50);
+      // closeできないケース対策：少し待ってまだ開いてたら遷移で戻す
+      setTimeout(() => {
+        if (returnUrl) location.href = buildReturnUrlWithCode(code);
+      }, 150);
       return;
-    } catch(_) {}
+    } catch(_) {
+      // postMessage失敗 → returnUrlへ
+      if (returnUrl) {
+        location.href = buildReturnUrlWithCode(code);
+        return;
+      }
+    }
   }
 
-  // 2) opener が無い/効かない：returnUrl に戻る（最重要）
-  if (goBackByReturnUrl(code)) return;
+  // openerなし → returnUrlへ
+  if (returnUrl) {
+    location.href = buildReturnUrlWithCode(code);
+    return;
+  }
 
-  // 3) 最後の保険
-  alert("SCAN: " + code);
+  // どうにもならない最終手段
+  setStatus("SCAN: " + code + "（戻り先が無いのでこの画面で終了）");
 }
 
-async function stop() {
-  if (!qr) return;
-  try { if (qr.isScanning) await qr.stop(); } catch(_) {}
-  try { await qr.clear(); } catch(_) {}
+function pickBackCamera(cameras) {
+  const keywords = ["back","rear","environment","背面","アウト","外側"];
+  const lower = (s) => String(s || "").toLowerCase();
+  for (const c of cameras) {
+    const label = lower(c.label);
+    if (keywords.some(k => label.includes(k))) return c;
+  }
+  return cameras[cameras.length - 1] || cameras[0] || null;
 }
 
-function getActiveVideoTrack() {
+async function tryApplyVideoTuning(videoEl) {
   try {
-    const v = document.querySelector("#reader video");
-    const s = v && v.srcObject;
-    const t = s && s.getVideoTracks && s.getVideoTracks()[0];
-    return t || null;
-  } catch(_) {
-    return null;
-  }
-}
+    const track = videoEl && videoEl.srcObject && videoEl.srcObject.getVideoTracks
+      ? videoEl.srcObject.getVideoTracks()[0]
+      : null;
+    if (!track) return;
 
-async function applyEnhancements() {
-  const track = getActiveVideoTrack();
-  if (!track) return;
+    const caps = track.getCapabilities ? track.getCapabilities() : null;
+    if (!caps) return;
 
-  const caps = (track.getCapabilities && track.getCapabilities()) || {};
-  const adv = [];
-
-  if (caps.zoom) {
-    const z = ZOOM_LEVELS[zoomIndex] ?? 1.0;
-    const min = caps.zoom.min ?? 1.0;
-    const max = caps.zoom.max ?? z;
-    const clamped = Math.max(min, Math.min(max, z));
-    try { await track.applyConstraints({ advanced: [{ zoom: clamped }] }); } catch(_) {}
-  }
-
-  if (caps.focusMode && Array.isArray(caps.focusMode) && caps.focusMode.includes("continuous")) {
-    adv.push({ focusMode: "continuous" });
-  }
-  if (caps.exposureMode && Array.isArray(caps.exposureMode) && caps.exposureMode.includes("continuous")) {
-    adv.push({ exposureMode: "continuous" });
-  }
-  if (adv.length) {
-    try { await track.applyConstraints({ advanced: adv }); } catch(_) {}
-  }
-}
-
-function bindDoubleTapToZoom() {
-  const el = document.getElementById("reader");
-  if (!el) return;
-
-  let last = 0;
-  el.addEventListener("touchend", async () => {
-    const now = Date.now();
-    if (now - last < 300) {
-      zoomIndex = (zoomIndex + 1) % ZOOM_LEVELS.length;
-      await applyEnhancements();
-      setStatus(`バーコードを枠内に合わせてください（ズーム ${ZOOM_LEVELS[zoomIndex]}x）`);
-      last = 0;
-      return;
+    const advanced = [];
+    if (caps.focusMode && Array.isArray(caps.focusMode) && caps.focusMode.includes("continuous")) {
+      advanced.push({ focusMode: "continuous" });
     }
-    last = now;
-  }, { passive: true });
-}
-
-async function getCamerasSafely() {
-  try { return await Html5Qrcode.getCameras(); } catch (_) { return []; }
-}
-
-// iOSはlabelが空のことがあるので capability も併用して判定
-function isLikelyFrontCamera(track) {
-  if (!track) return true;
-
-  const label = (track.label || "");
-  const l = label.toLowerCase();
-
-  const caps = (track.getCapabilities && track.getCapabilities()) || {};
-  const hasTorch = !!caps.torch;
-  const hasZoom = !!(caps.zoom && (caps.zoom.max ?? 1) > 1.01);
-
-  // 背面の強い特徴（torch/zoomがあれば背面寄り）
-  if (hasTorch || hasZoom) return false;
-
-  // ラベル判定（取れるときだけ）
-  const frontHit = /front|user|selfie|前面|イン/i.test(l);
-  const backHit  = /back|rear|environment|wide|ultra|tele|背面|リア|後/i.test(l);
-
-  if (backHit) return false;
-  if (frontHit) return true;
-
-  // 判断不能なら「前面かも」と扱ってスイッチを試す
-  return true;
-}
-
-async function startHtml5(cameraConfig) {
-  // 前回の固定化を切るため毎回作り直す
-  try { if (qr) await stop(); } catch(_) {}
-  qr = new Html5Qrcode("reader", { verbose:false });
-
-  await qr.start(
-    cameraConfig,
-    {
-      fps: 15,
-      qrbox: { width: 340, height: 150 },
-      formatsToSupport: formats,
-      aspectRatio: 1.777,
-      disableFlip: true,
-      videoConstraints: {
-        width:  { ideal: 1920 },
-        height: { ideal: 1080 },
-        frameRate: { ideal: 30, max: 30 }
-      }
-    },
-    async (decodedText) => {
-      const code = String(decodedText || "").trim();
-      if (!code) return;
-      if (finishing) return; // 多重発火防止
-      finishing = true;
-
-      setStatus("JANコード読み取り成功: " + code);
-
-      try { await stop(); } catch(_) {}
-      sendResult(code);
-    },
-    () => {}
-  );
-}
-
-// 「候補カメラ群」を作る：deviceId列 → 最後にenvironment
-function buildCandidateConfigs(cameraIds) {
-  const configs = [];
-  for (const id of cameraIds) {
-    // html5-qrcodeの制限：cameraIdOrConfig を object で渡すなら keyは1つだけ
-    configs.push({ deviceId: { exact: id } });
-    configs.push({ deviceId: id }); // ideal的に効くことがある
-  }
-  configs.push({ facingMode: "environment" });
-  return configs;
-}
-
-async function startWithAutoSwitch() {
-  const cams = await getCamerasSafely();
-  if (!cams.length) throw new Error("no cameras");
-
-  // まずは「背面っぽい順」に並べる：labelにback系が含まれるものを優先
-  const sorted = [...cams].sort((a,b) => {
-    const al = (a.label||"").toLowerCase();
-    const bl = (b.label||"").toLowerCase();
-    const aBack = /back|rear|environment|wide|ultra|tele|背面|リア|後/i.test(al);
-    const bBack = /back|rear|environment|wide|ultra|tele|背面|リア|後/i.test(bl);
-    if (aBack === bBack) return 0;
-    return aBack ? -1 : 1;
-  });
-
-  const ids = sorted.map(c => c.id);
-  const candidates = buildCandidateConfigs(ids);
-
-  bindDoubleTapToZoom();
-
-  let tries = 0;
-  for (const cfg of candidates) {
-    tries++;
-    if (tries > MAX_SWITCH_TRIES) break;
-
-    setStatus(`カメラ起動中…（背面選択を試行 ${tries}/${Math.min(MAX_SWITCH_TRIES, candidates.length)}）`);
-
-    try {
-      await startHtml5(cfg);
-
-      // 起動後判定
-      await new Promise(r => setTimeout(r, FRONT_DETECT_DELAY_MS));
-      const track = getActiveVideoTrack();
-
-      if (isLikelyFrontCamera(track)) {
-        // 前面濃厚 → 次へ
-        try { await stop(); } catch(_) {}
-        continue;
-      }
-
-      // 背面っぽい → ここで確定、調整適用
-      await applyEnhancements();
-      setStatus("バーコードを枠内に合わせてください（ダブルタップでズーム切替）");
-      return;
-
-    } catch (e) {
-      try { await stop(); } catch(_) {}
-      continue;
+    if (caps.zoom) {
+      const min = caps.zoom.min;
+      const max = caps.zoom.max;
+      const z = Math.min(max, Math.max(min, min + (max - min) * 0.70));
+      advanced.push({ zoom: z });
     }
-  }
-
-  // ここまで来たら「切替が効かない環境」なので、とりあえずenvironmentで起動を試す
-  setStatus("背面固定に失敗。environmentで起動します…", true);
-  await startHtml5({ facingMode: "environment" });
-  await new Promise(r => setTimeout(r, FRONT_DETECT_DELAY_MS));
-  await applyEnhancements();
-  setStatus("バーコードを枠内に合わせてください（ダブルタップでズーム切替）");
+    if (advanced.length) {
+      await track.applyConstraints({ advanced });
+    }
+  } catch(_) {}
 }
 
 async function start() {
-  if (starting) return;
-  starting = true;
-  finishing = false;
+  if (busy) return;
+  busy = true;
+  done = false;
 
   try {
     if (!window.isSecureContext) {
@@ -316,41 +188,81 @@ async function start() {
       return;
     }
 
-    zoomIndex = 0;
-    setStatus("背面カメラを選択中…");
+    if (!qr) qr = new Html5Qrcode("reader", { verbose:false });
+    await stopWithTimeout(800);
 
-    await startWithAutoSwitch();
+    setStatus("カメラ準備中…（許可ダイアログが出たら許可）");
+
+    const cameras = await Html5Qrcode.getCameras();
+    if (!cameras || cameras.length === 0) {
+      setStatus("カメラが見つかりませんでした（権限/デバイスを確認）", true);
+      return;
+    }
+
+    const cam = pickBackCamera(cameras);
+    if (!cam || !cam.id) {
+      setStatus("カメラIDを取得できませんでした", true);
+      return;
+    }
+
+    setStatus("カメラ起動中…（バーコードを枠内へ）");
+
+    await qr.start(
+      cam.id,
+      {
+        fps: 10,
+        qrbox: { width: 320, height: 80 },
+        formatsToSupport: formats,
+        disableFlip: false,
+        videoConstraints: {
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        }
+      },
+      async (decodedText) => {
+        if (done) return;
+
+        const now = Date.now();
+        if (now - lastAcceptedAt < 900) return;
+
+        const code = normalizeCode(decodedText);
+        if (!isValidJan(code)) return;
+
+        // ✅ ここから先は一度だけ
+        done = true;
+        lastAcceptedAt = now;
+
+        setStatus("JANコード読み取り成功: " + code);
+        await hardFinishAndReturn(code);
+      },
+      () => {}
+    );
+
+    setTimeout(() => {
+      const video = document.querySelector("#reader video");
+      tryApplyVideoTuning(video);
+    }, 700);
+
+    setStatus("バーコードを枠内に合わせてください");
 
   } catch(e) {
     setStatus(
       "起動失敗: " + ((e && e.name) || "Error") + " / " + ((e && e.message) || e) +
-      "\n・Safariのサイト設定でカメラ許可をON" +
-      "\n・別タブ/別アプリでカメラ使用中なら閉じる",
+      "\n・ブラウザのカメラ許可ON" +
+      "\n・LINE等のアプリ内ブラウザではなくChrome/Safariで開く",
       true
     );
   } finally {
-    // ✅ startの多重起動だけ解除（背面探索自体は startWithAutoSwitch 内で完結）
-    starting = false;
+    busy = false;
   }
 }
 
-document.getElementById("retry").addEventListener("click", async () => {
-  // 再試行は停止してから
-  finishing = false;
-  try { await stop(); } catch(_) {}
-  start();
-});
-
+document.getElementById("retry").addEventListener("click", start);
 document.getElementById("cancel").addEventListener("click", async () => {
-  finishing = true;
-  await stop();
-  // iOSは閉じられないことが多いので、returnUrlがあれば戻す
-  if (returnUrl) {
-    try { location.replace(returnUrl); return; } catch(_) {}
-    location.href = returnUrl;
-    return;
-  }
+  done = true;
+  await stopWithTimeout(800);
   try { window.close(); } catch(_) {}
+  if (returnUrl) location.href = returnUrl;
 });
 
 start();
