@@ -20,7 +20,7 @@ video { filter: contrast(1.45) brightness(1.12); }
 </head>
 
 <body>
-<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-07</div>
+<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-08</div>
 <div id="reader"></div>
 <div class="p" id="status">起動中…</div>
 
@@ -53,6 +53,9 @@ let qr = null;
 let busy = false;
 let lastAcceptedAt = 0;
 let done = false;
+
+// 「再試行」で背面を取り直すためのトグル（ユーザー操作起点を作る）
+let forceBackOnRetry = true;
 
 function onlyDigits(s){ return /^[0-9]+$/.test(s); }
 
@@ -124,18 +127,16 @@ async function hardFinishAndReturn(code) {
   setStatus("SCAN: " + code + "（戻り先が無いのでこの画面で終了）");
 }
 
-async function tryApplyVideoTuning(videoEl) {
+async function tryApplyVideoTuning() {
   try {
-    const track = videoEl && videoEl.srcObject && videoEl.srcObject.getVideoTracks
-      ? videoEl.srcObject.getVideoTracks()[0]
-      : null;
+    const video = document.querySelector("#reader video");
+    const track = video?.srcObject?.getVideoTracks?.()[0];
     if (!track) return;
 
     const caps = track.getCapabilities ? track.getCapabilities() : null;
     if (!caps) return;
 
     const advanced = [];
-
     if (caps.focusMode && Array.isArray(caps.focusMode) && caps.focusMode.includes("continuous")) {
       advanced.push({ focusMode: "continuous" });
     }
@@ -149,6 +150,74 @@ async function tryApplyVideoTuning(videoEl) {
       await track.applyConstraints({ advanced });
     }
   } catch(_) {}
+}
+
+// ---- ここが肝：背面要求を段階的に試す ----
+async function startWithPreference(preferBackStrong) {
+  if (!qr) qr = new Html5Qrcode("reader", { verbose:false });
+
+  // ① strongest: exact environment（通れば背面確定）
+  if (preferBackStrong) {
+    try {
+      await qr.start(
+        { facingMode: { exact: "environment" } }, // ✅トップレベル1キー
+        {
+          fps: 10,
+          qrbox: { width: 320, height: 80 },
+          formatsToSupport: formats,
+          disableFlip: false,
+          videoConstraints: { width: { ideal: 1920 }, height: { ideal: 1080 } }
+        },
+        async (decodedText) => {
+          if (done) return;
+          const now = Date.now();
+          if (now - lastAcceptedAt < 900) return;
+          const code = normalizeCode(decodedText);
+          if (!isValidJan(code)) return;
+          done = true;
+          lastAcceptedAt = now;
+          setStatus("JANコード読み取り成功: " + code);
+          await hardFinishAndReturn(code);
+        },
+        () => {}
+      );
+      setTimeout(tryApplyVideoTuning, 700);
+      return true;
+    } catch(_) {
+      // 次にフォールバック
+      await stopWithTimeout(800);
+    }
+  }
+
+  // ② fallback: environment（無視されることもあるが試す価値あり）
+  try {
+    await qr.start(
+      { facingMode: "environment" }, // ✅トップレベル1キー
+      {
+        fps: 10,
+        qrbox: { width: 320, height: 80 },
+        formatsToSupport: formats,
+        disableFlip: false,
+        videoConstraints: { width: { ideal: 1920 }, height: { ideal: 1080 } }
+      },
+      async (decodedText) => {
+        if (done) return;
+        const now = Date.now();
+        if (now - lastAcceptedAt < 900) return;
+        const code = normalizeCode(decodedText);
+        if (!isValidJan(code)) return;
+        done = true;
+        lastAcceptedAt = now;
+        setStatus("JANコード読み取り成功: " + code);
+        await hardFinishAndReturn(code);
+      },
+      () => {}
+    );
+    setTimeout(tryApplyVideoTuning, 700);
+    return true;
+  } catch(e) {
+    throw e;
+  }
 }
 
 async function start() {
@@ -167,51 +236,31 @@ async function start() {
 
     setStatus("カメラ起動中…（許可ダイアログが出たら許可）");
 
-    // ✅ iPhone/Safari対策：背面を “要求” する（トップレベル1キーのみ）
-    const cameraIdOrConfig = { facingMode: "environment" };
+    // 初回は「強い背面要求」をON
+    await startWithPreference(true);
 
-    await qr.start(
-      cameraIdOrConfig,
-      {
-        fps: 10,
-        qrbox: { width: 320, height: 80 },
-        formatsToSupport: formats,
-        disableFlip: false,
-        videoConstraints: {
-          width: { ideal: 1920 },
-          height: { ideal: 1080 }
-        }
-      },
-      async (decodedText) => {
-        if (done) return;
-
-        const now = Date.now();
-        if (now - lastAcceptedAt < 900) return;
-
-        const code = normalizeCode(decodedText);
-        if (!isValidJan(code)) return;
-
-        done = true;
-        lastAcceptedAt = now;
-
-        setStatus("JANコード読み取り成功: " + code);
-        await hardFinishAndReturn(code);
-      },
-      () => {}
-    );
-
-    setTimeout(() => {
-      const video = document.querySelector("#reader video");
-      tryApplyVideoTuning(video);
-    }, 700);
-
-    setStatus("バーコードを枠内に合わせてください");
+    setStatus("バーコードを枠内に合わせてください\n※内カメのままなら「再試行」を1回押してください");
 
   } catch(e) {
+    const name = (e && e.name) || "Error";
+    const msg  = (e && e.message) || String(e);
+
+    // exact環境が取れない/拒否されたケース
+    if (name === "OverconstrainedError" || name === "NotFoundError") {
+      setStatus(
+        "背面カメラを起動できませんでした。\n" +
+        "（Slack内ブラウザ等では端末側の都合で内カメになることがあります）\n" +
+        "【対処】「再試行」を押して背面を取り直してください。\n" +
+        "それでもダメな場合は共有ボタン→Safariで開く。",
+        true
+      );
+      return;
+    }
+
     setStatus(
-      "起動失敗: " + ((e && e.name) || "Error") + " / " + ((e && e.message) || e) +
+      "起動失敗: " + name + " / " + msg +
       "\n・Safariのカメラ許可がONか確認" +
-      "\n・別タブ/別アプリでカメラ使用中だと失敗します",
+      "\n・別アプリでカメラ使用中だと失敗します",
       true
     );
   } finally {
@@ -219,7 +268,30 @@ async function start() {
   }
 }
 
-document.getElementById("retry").addEventListener("click", start);
+// ✅ 再試行は “ユーザー操作起点” で背面を取り直す（これがWKWebViewで効きやすい）
+document.getElementById("retry").addEventListener("click", async () => {
+  if (busy) return;
+  busy = true;
+  done = false;
+  try {
+    await stopWithTimeout(800);
+    setStatus("背面カメラで再起動中…");
+    // 再試行時は exact を必ず試す（ユーザー操作なので通りやすい）
+    await startWithPreference(true);
+    setStatus("バーコードを枠内に合わせてください");
+  } catch(e) {
+    const name = (e && e.name) || "Error";
+    const msg  = (e && e.message) || String(e);
+    setStatus(
+      "再試行失敗: " + name + " / " + msg +
+      "\n・共有ボタン→Safariで開くが最も確実です",
+      true
+    );
+  } finally {
+    busy = false;
+  }
+});
+
 document.getElementById("cancel").addEventListener("click", async () => {
   done = true;
   await stopWithTimeout(800);
