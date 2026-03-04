@@ -15,7 +15,7 @@ button { border:0; border-radius:10px; padding:12px; font-weight:900; font-size:
 .pri { background:#0f766e; color:#fff; }
 .sub { background:#e5e7eb; color:#111827; }
 .err { color:#fecaca; }
-video { filter: contrast(1.55) brightness(1.10) saturate(1.05); }
+video { width:100%; height:auto; filter: contrast(1.55) brightness(1.10) saturate(1.05); }
 </style>
 </head>
 
@@ -57,10 +57,11 @@ let busy = false;
 const ZOOM_LEVELS = [1.0, 1.8, 2.6];
 let zoomIndex = 0;
 
+// 起動判定待ち
 const FRONT_DETECT_DELAY_MS = 260;
 
 // startハング対策
-const START_TIMEOUT_MS = 6500;
+const START_TIMEOUT_MS = 7000;
 
 // フリーズ監視
 const WATCHDOG_INTERVAL_MS = 1200;
@@ -71,7 +72,7 @@ let stallCount = 0;
 let lastCameraConfig = null;
 
 // 背面deviceIdをキャッシュ（同一端末で効く）
-const REAR_ID_CACHE_KEY = "rearDeviceIdCache_v1";
+const REAR_ID_CACHE_KEY = "rearDeviceIdCache_v2";
 
 function withTimeout(promise, ms, label="timeout") {
   let t = null;
@@ -133,6 +134,7 @@ async function applyEnhancements() {
   const caps = (track.getCapabilities && track.getCapabilities()) || {};
   const adv = [];
 
+  // ズーム
   if (caps.zoom) {
     const z = ZOOM_LEVELS[zoomIndex] ?? 1.0;
     const min = caps.zoom.min ?? 1.0;
@@ -141,12 +143,24 @@ async function applyEnhancements() {
     try { await track.applyConstraints({ advanced: [{ zoom: clamped }] }); } catch(_) {}
   }
 
+  // 可能なら連続AF/AE
   if (caps.focusMode && Array.isArray(caps.focusMode) && caps.focusMode.includes("continuous")) {
     adv.push({ focusMode: "continuous" });
   }
   if (caps.exposureMode && Array.isArray(caps.exposureMode) && caps.exposureMode.includes("continuous")) {
     adv.push({ exposureMode: "continuous" });
   }
+
+  // 可能なら解像度寄せ（iOSは効かないこともあるのでtryのみ）
+  // ※start時に videoConstraints を入れると前面に落ちることがあるため「起動後」に試す
+  try {
+    await track.applyConstraints({
+      width:  { ideal: 1920 },
+      height: { ideal: 1080 },
+      frameRate: { ideal: 30, max: 30 }
+    });
+  } catch(_) {}
+
   if (adv.length) {
     try { await track.applyConstraints({ advanced: adv }); } catch(_) {}
   }
@@ -170,7 +184,7 @@ function bindDoubleTapToZoom() {
   }, { passive: true });
 }
 
-// capability優先の前面判定
+// capability優先の前面判定（torch/zoomが無い＝前面寄り）
 function isLikelyFrontCamera(track) {
   if (!track) return true;
 
@@ -193,19 +207,14 @@ async function startHtml5(cameraConfig) {
   qr = new Html5Qrcode("reader", { verbose:false });
   lastCameraConfig = cameraConfig;
 
+  // ★重要：iOSで前面に落ちる原因になりやすいので、start時の videoConstraints/aspectRatio は渡さない
   const p = qr.start(
     cameraConfig,
     {
       fps: 15,
       qrbox: { width: 340, height: 150 },
       formatsToSupport: formats,
-      aspectRatio: 1.777,
-      disableFlip: true,
-      videoConstraints: {
-        width:  { ideal: 1920 },
-        height: { ideal: 1080 },
-        frameRate: { ideal: 30, max: 30 }
-      }
+      disableFlip: true
     },
     async (decodedText) => {
       const code = String(decodedText || "").trim();
@@ -220,7 +229,7 @@ async function startHtml5(cameraConfig) {
   await withTimeout(p, START_TIMEOUT_MS, "start timeout");
 }
 
-// フリーズ監視
+// フリーズ監視（映像停止→再起動）
 function startWatchdog() {
   stopWatchdog();
   lastVideoTime = -1;
@@ -241,7 +250,7 @@ function startWatchdog() {
         stallCount = 0;
         setStatus("映像が停止したため再起動します…", true);
 
-        const cfg = lastCameraConfig || { facingMode: "environment" };
+        const cfg = lastCameraConfig || { facingMode: { exact: "environment" } };
         try { await stop(); } catch(_) {}
         try {
           await startHtml5(cfg);
@@ -268,87 +277,12 @@ function stopWatchdog() {
   }
 }
 
-/**
- * ★ここが核心
- * getUserMedia の facingMode exact environment で「背面の実ストリーム」を掴み、
- * track.getSettings().deviceId を抜き取って返す。
- */
-async function getRearDeviceIdByStrictGUM() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return null;
-
-  // キャッシュがあれば先に返す（ダメなら後段で検証される）
-  try {
-    const cached = localStorage.getItem(REAR_ID_CACHE_KEY);
-    if (cached) return cached;
-  } catch(_) {}
-
-  try {
-    const stream = await withTimeout(
-      navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { exact: "environment" },
-          width:  { ideal: 1920 },
-          height: { ideal: 1080 }
-        },
-        audio: false
-      }),
-      4500,
-      "gum exact env timeout"
-    );
-
-    const track = stream.getVideoTracks()[0];
-    const settings = (track && track.getSettings && track.getSettings()) || {};
-    const deviceId = settings.deviceId || null;
-
-    // 止める
-    try { stream.getTracks().forEach(t => t.stop()); } catch(_) {}
-
-    if (deviceId) {
-      try { localStorage.setItem(REAR_ID_CACHE_KEY, deviceId); } catch(_) {}
-      return deviceId;
-    }
-    return null;
-  } catch(_) {
-    return null;
-  }
-}
-
 async function getCamerasSafely() {
   try { return await Html5Qrcode.getCameras(); } catch (_) { return []; }
 }
 
-async function startWithRearFixed() {
-  bindDoubleTapToZoom();
-
-  // 1) strict GUM で背面deviceId取得（最優先）
-  setStatus("背面カメラを選択中…（背面を確定中）");
-  const rearId = await getRearDeviceIdByStrictGUM();
-
-  if (rearId) {
-    // 取得できたIDで起動
-    setStatus("背面カメラ起動中…");
-    await startHtml5({ deviceId: { exact: rearId } });
-
-    await new Promise(r => setTimeout(r, FRONT_DETECT_DELAY_MS));
-    const track = getActiveVideoTrack();
-
-    // もしここで前面っぽいならキャッシュが間違いなので破棄して次へ
-    if (track && isLikelyFrontCamera(track)) {
-      try { localStorage.removeItem(REAR_ID_CACHE_KEY); } catch(_) {}
-      await stop();
-    } else {
-      await applyEnhancements();
-      setStatus("バーコードを枠内に合わせてください（ダブルタップでズーム切替）");
-      startWatchdog();
-      return;
-    }
-  }
-
-  // 2) 列挙して背面っぽい順に1〜2個だけ試す（iOSでdeviceIdが無視される場合はここも前面になる）
-  const cams = await getCamerasSafely();
-  if (!cams.length) throw new Error("no cameras");
-
-  const sorted = [...cams].sort((a,b) => {
+function sortBackFirst(cams) {
+  return [...cams].sort((a,b) => {
     const al = (a.label||"").toLowerCase();
     const bl = (b.label||"").toLowerCase();
     const aBack = /back|rear|environment|wide|ultra|tele|背面|リア|後/i.test(al);
@@ -356,7 +290,56 @@ async function startWithRearFixed() {
     if (aBack === bBack) return 0;
     return aBack ? -1 : 1;
   });
+}
 
+async function startWithRearFixed() {
+  bindDoubleTapToZoom();
+
+  // 0) キャッシュされた背面deviceIdがあれば最優先で試す
+  try {
+    const cached = localStorage.getItem(REAR_ID_CACHE_KEY);
+    if (cached) {
+      setStatus("背面カメラ起動中…");
+      await startHtml5({ deviceId: { exact: cached } });
+      await new Promise(r => setTimeout(r, FRONT_DETECT_DELAY_MS));
+      const track = getActiveVideoTrack();
+      if (track && !isLikelyFrontCamera(track)) {
+        await applyEnhancements();
+        setStatus("バーコードを枠内に合わせてください（ダブルタップでズーム切替）");
+        startWatchdog();
+        return;
+      }
+      await stop();
+      try { localStorage.removeItem(REAR_ID_CACHE_KEY); } catch(_) {}
+    }
+  } catch(_) {}
+
+  // 1) iOS向け：facingMode exact を最初に試す（ここで通れば背面確定）
+  setStatus("背面カメラ起動中…");
+  try {
+    await startHtml5({ facingMode: { exact: "environment" } });
+    await new Promise(r => setTimeout(r, FRONT_DETECT_DELAY_MS));
+    const track = getActiveVideoTrack();
+    if (track && !isLikelyFrontCamera(track)) {
+      // 取れたdeviceIdをキャッシュ
+      const s = (track.getSettings && track.getSettings()) || {};
+      if (s.deviceId) { try { localStorage.setItem(REAR_ID_CACHE_KEY, s.deviceId); } catch(_) {} }
+      await applyEnhancements();
+      setStatus("バーコードを枠内に合わせてください（ダブルタップでズーム切替）");
+      startWatchdog();
+      return;
+    }
+    await stop();
+  } catch(e) {
+    // exactで落ちても次へ
+    try { await stop(); } catch(_) {}
+  }
+
+  // 2) カメラ列挙→背面っぽい順に（最大2つ）試す
+  const cams = await getCamerasSafely();
+  if (!cams.length) throw new Error("no cameras");
+
+  const sorted = sortBackFirst(cams);
   const tryList = sorted.slice(0, Math.min(2, sorted.length));
 
   for (let i=0; i<tryList.length; i++) {
@@ -366,11 +349,8 @@ async function startWithRearFixed() {
       await new Promise(r => setTimeout(r, FRONT_DETECT_DELAY_MS));
       const track = getActiveVideoTrack();
       if (track && !isLikelyFrontCamera(track)) {
-        // 背面っぽいならそのdeviceIdをキャッシュ
-        const settings = (track.getSettings && track.getSettings()) || {};
-        if (settings.deviceId) {
-          try { localStorage.setItem(REAR_ID_CACHE_KEY, settings.deviceId); } catch(_) {}
-        }
+        const s = (track.getSettings && track.getSettings()) || {};
+        if (s.deviceId) { try { localStorage.setItem(REAR_ID_CACHE_KEY, s.deviceId); } catch(_) {} }
         await applyEnhancements();
         setStatus("バーコードを枠内に合わせてください（ダブルタップでズーム切替）");
         startWatchdog();
@@ -423,7 +403,7 @@ document.addEventListener("visibilitychange", async () => {
 });
 
 document.getElementById("retry").addEventListener("click", async () => {
-  // retry時はキャッシュを一旦捨てて再確定（背面固定の再トライを強くする）
+  // retry時はキャッシュを捨てて再探索（iOSの固定化を崩す）
   try { localStorage.removeItem(REAR_ID_CACHE_KEY); } catch(_) {}
   await start();
 });
