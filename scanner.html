@@ -17,20 +17,18 @@ button { border:0; border-radius:10px; padding:12px; font-weight:900; font-size:
 .err { color:#fecaca; }
 
 /* コントラスト強化（色付き背景対策） */
-video {
-  filter: contrast(1.4) brightness(1.1);
-}
+video { filter: contrast(1.4) brightness(1.1); }
 </style>
 </head>
 
 <body>
-<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-01</div>
+<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-02</div>
 <div id="reader"></div>
 <div class="p" id="status">起動中…</div>
 
 <div class="btns">
-<button class="pri" id="retry" type="button">再試行</button>
-<button class="sub" id="cancel" type="button">キャンセル</button>
+  <button class="pri" id="retry" type="button">再試行</button>
+  <button class="sub" id="cancel" type="button">キャンセル</button>
 </div>
 
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
@@ -60,6 +58,7 @@ let busy = false;
 function sendResult(code) {
   const payload = { type:"barcode", code, target, tab };
 
+  // 1) opener があれば postMessage
   if (window.opener) {
     try {
       window.opener.postMessage(payload, returnOrigin);
@@ -68,6 +67,7 @@ function sendResult(code) {
     } catch(_) {}
   }
 
+  // 2) opener が無ければ returnUrl に code を付けて戻る
   if (returnUrl) {
     const u = new URL(returnUrl);
     u.searchParams.set("tab", tab);
@@ -86,6 +86,19 @@ async function stop() {
   try { await qr.clear(); } catch(_) {}
 }
 
+function pickBackCamera(cameras) {
+  const keywords = ["back","rear","environment","背面","アウト","外側"];
+  const lower = (s) => String(s || "").toLowerCase();
+
+  // label から背面らしいものを優先
+  for (const c of cameras) {
+    const label = lower(c.label);
+    if (keywords.some(k => label.includes(k))) return c;
+  }
+  // ない場合は末尾を優先（背面が後ろに来やすい環境が多い）
+  return cameras[cameras.length - 1] || cameras[0] || null;
+}
+
 async function start() {
   if (busy) return;
   busy = true;
@@ -99,28 +112,31 @@ async function start() {
     if (!qr) qr = new Html5Qrcode("reader", { verbose:false });
     await stop();
 
-    setStatus("カメラ起動中…（許可ダイアログが出たら許可）");
+    setStatus("カメラ準備中…（許可ダイアログが出たら許可）");
 
-    // ✅ 修正点：
-    // html5-qrcode の start() 第1引数(cameraIdOrConfig) は
-    // 「文字列カメラID」または「キーが1つだけのオブジェクト」しか許可されません。
-    // ここで width/height を入れると今回のエラーになります。
-    //
-    // width/height 等の制約は第2引数(config)に寄せるのが安全です。
+    // ✅ 重要：cameraIdOrConfig の object を使わず、カメラID文字列で start する
+    const cameras = await Html5Qrcode.getCameras();
+    if (!cameras || cameras.length === 0) {
+      setStatus("カメラが見つかりませんでした（権限/デバイスを確認）", true);
+      return;
+    }
+
+    const cam = pickBackCamera(cameras);
+    if (!cam || !cam.id) {
+      setStatus("カメラIDを取得できませんでした", true);
+      return;
+    }
+
+    setStatus("カメラ起動中…（バーコードを枠内へ）");
+
     await qr.start(
-      { facingMode: "environment" },   // ← キー1つだけにする
+      cam.id, // ← 文字列IDなので「object should have exactly 1 key」系を根絶
       {
-        fps:15,
-        qrbox:{ width:320, height:140 },   // 横長（JAN最適）
-        formatsToSupport:formats,
-        aspectRatio:1.777,
-        disableFlip:true,
-
-        // 可能なら解像度の希望はここに寄せる（未対応端末もあるので「理想値」程度に）
-        videoConstraints: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        }
+        fps: 15,
+        qrbox: { width: 320, height: 140 }, // 横長（JAN最適）
+        formatsToSupport: formats,
+        aspectRatio: 1.777,
+        disableFlip: true
       },
       async (decodedText) => {
         const code = String(decodedText || "").trim();
@@ -128,9 +144,8 @@ async function start() {
 
         setStatus("JANコード読み取り成功: " + code);
 
-        // ===== 読み取り後すぐ停止 =====
+        // 読み取り後すぐ停止
         await stop();
-
         sendResult(code);
       },
       () => {}
