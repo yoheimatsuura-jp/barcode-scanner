@@ -15,14 +15,12 @@ button { border:0; border-radius:10px; padding:12px; font-weight:900; font-size:
 .pri { background:#0f766e; color:#fff; }
 .sub { background:#e5e7eb; color:#111827; }
 .err { color:#fecaca; }
-
-/* 色付き背景/反射対策（少し強め） */
 video { filter: contrast(1.55) brightness(1.10) saturate(1.05); }
 </style>
 </head>
 
 <body>
-<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-11</div>
+<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-12</div>
 <div id="reader"></div>
 <div class="p" id="status">起動中…</div>
 
@@ -55,7 +53,7 @@ const setStatus = (t, err=false) => {
 let qr = null;
 let busy = false;
 
-// ズーム段階（UIは増やさず、ダブルタップで切替）
+// ズーム段階（UI増やさず、ダブルタップで切替）
 const ZOOM_LEVELS = [1.0, 1.8, 2.6];
 let zoomIndex = 0;
 
@@ -99,7 +97,6 @@ function getActiveVideoTrack() {
   }
 }
 
-// iOSでも効く範囲で zoom / focus / exposure
 async function applyEnhancements() {
   const track = getActiveVideoTrack();
   if (!track) return;
@@ -107,7 +104,6 @@ async function applyEnhancements() {
   const caps = (track.getCapabilities && track.getCapabilities()) || {};
   const adv = [];
 
-  // zoom
   if (caps.zoom) {
     const z = ZOOM_LEVELS[zoomIndex] ?? 1.0;
     const min = caps.zoom.min ?? 1.0;
@@ -145,52 +141,39 @@ function bindDoubleTapToZoom() {
   }, { passive: true });
 }
 
-// ---- ここが重要：背面カメラを「能力」で確定する ----
 async function getCamerasSafely() {
   try { return await Html5Qrcode.getCameras(); } catch (_) { return []; }
 }
 
+// ---- deviceIdを一瞬だけ起動して背面候補をスコアリング ----
 async function probeCamera(deviceId) {
-  // iOSはここで user/environment 指定が無視されることがあるので deviceId exact で試す
   const constraints = { video: { deviceId: { exact: deviceId } }, audio: false };
-
   let stream = null;
   try {
     stream = await navigator.mediaDevices.getUserMedia(constraints);
     const track = stream.getVideoTracks()[0];
     const caps = (track.getCapabilities && track.getCapabilities()) || {};
-    const settings = (track.getSettings && track.getSettings()) || {};
     const label = track.label || "";
 
-    // 背面っぽい指標：
-    // - torch がある（背面に多い）
-    // - zoom がある/最大が1より大きい（背面に多い）
     const hasTorch = !!caps.torch;
     const zoomMax = caps.zoom ? (caps.zoom.max ?? 1) : 1;
     const hasZoom = zoomMax > 1.01;
 
-    // label も参考（ただし信用しない）
     const l = label.toLowerCase();
-    const labelBackHit =
-      ["back","rear","environment","wide","ultra","tele","背面","アウト","外側","後","リア"].some(k => l.includes(k));
-    const labelFrontHit =
-      ["front","user","selfie","前面","イン","内側"].some(k => l.includes(k));
+    const labelBackHit = ["back","rear","environment","wide","ultra","tele","背面","アウト","外側","後","リア"].some(k => l.includes(k));
+    const labelFrontHit = ["front","user","selfie","前面","イン","内側"].some(k => l.includes(k));
 
-    // スコアリング（能力優先）
     let score = 0;
     if (hasTorch) score += 100;
     if (hasZoom) score += 60;
     if (labelBackHit) score += 10;
     if (labelFrontHit) score -= 80;
 
-    return { ok:true, deviceId, score, label, settings, caps };
-
+    return { ok:true, deviceId, score, label, caps };
   } catch (e) {
-    return { ok:false, deviceId, score:-9999, err: e };
+    return { ok:false, deviceId, score:-9999, err:e };
   } finally {
-    try {
-      if (stream) stream.getTracks().forEach(t => t.stop());
-    } catch (_) {}
+    try { if (stream) stream.getTracks().forEach(t => t.stop()); } catch(_) {}
   }
 }
 
@@ -198,60 +181,91 @@ async function selectBestCameraId() {
   const cams = await getCamerasSafely();
   if (!cams.length) return null;
 
-  // まずは全カメラを軽くプローブ（成功したやつだけ）
   const results = [];
   for (const c of cams) {
-    // プローブは重いので、最大3台まで（iPhoneは通常2〜3）
     const r = await probeCamera(c.id);
     if (r.ok) results.push(r);
-    if (results.length >= 3) break;
   }
-
-  if (!results.length) {
-    // プローブ失敗＝権限/環境問題が濃厚。最後の手段として1つ返す
-    return cams[0].id;
-  }
+  if (!results.length) return cams[0].id;
 
   results.sort((a,b) => b.score - a.score);
   return results[0].deviceId;
 }
 
-async function startWithCameraId(cameraId) {
-  // ★重要：cameraIdOrConfig は「1キーのみ」じゃないとエラーになるため deviceId exact だけ
-  const cameraConfig = { deviceId: { exact: cameraId } };
+// ---- ここが今回の肝：背面が取れない時の段階的フォールバック ----
+async function startWithFallback(cameraId) {
+  // html5-qrcodeのcameraIdOrConfigは「オブジェクトなら1キー」制限があるので注意
+  const attempts = [
+    { name: "deviceId-exact", camera: { deviceId: { exact: cameraId } } },
+    // iOSが exact を無視するケースがあるので ideal も試す
+    { name: "deviceId-ideal", camera: { deviceId: cameraId } },
+    // それでもダメなら facingMode を試す（Slack/Safariがこっちは通すことがある）
+    { name: "facingMode-environment", camera: { facingMode: "environment" } },
+  ];
 
-  await qr.start(
-    cameraConfig,
-    {
-      fps: 15,
-      qrbox: { width: 340, height: 150 },
-      formatsToSupport: formats,
-      aspectRatio: 1.777,
-      disableFlip: true,
+  let lastErr = null;
 
-      // 解像度を上げる（読み取り復活に効く）
-      videoConstraints: {
-        width:  { ideal: 1920 },
-        height: { ideal: 1080 },
-        frameRate: { ideal: 30, max: 30 }
+  for (const a of attempts) {
+    try {
+      // 毎回インスタンス作り直し（前回の固定化を切る）
+      try { if (qr) await stop(); } catch(_) {}
+      qr = new Html5Qrcode("reader", { verbose:false });
+
+      await qr.start(
+        a.camera,
+        {
+          fps: 15,
+          qrbox: { width: 340, height: 150 },
+          formatsToSupport: formats,
+          aspectRatio: 1.777,
+          disableFlip: true,
+          videoConstraints: {
+            width:  { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 30, max: 30 }
+          }
+        },
+        async (decodedText) => {
+          const code = String(decodedText || "").trim();
+          if (!code) return;
+
+          setStatus("JANコード読み取り成功: " + code);
+          await stop();
+          sendResult(code);
+        },
+        () => {}
+      );
+
+      // 起動直後に「前面っぽい」なら次の手へ（track label を軽く見る：参考程度）
+      await new Promise(r => setTimeout(r, 220));
+      const track = getActiveVideoTrack();
+      const label = (track && track.label) ? track.label : "";
+      const isLikelyFront = /front|user|selfie|前面|イン/i.test(label);
+
+      // labelが空のこともあるので、能力でも見る
+      const caps = (track && track.getCapabilities) ? (track.getCapabilities() || {}) : {};
+      const hasTorch = !!caps.torch;
+      const hasZoom = !!(caps.zoom && (caps.zoom.max ?? 1) > 1.01);
+
+      // 背面の可能性が高ければ確定
+      if (!isLikelyFront || hasTorch || hasZoom) {
+        bindDoubleTapToZoom();
+        await new Promise(r => setTimeout(r, 160));
+        await applyEnhancements();
+        return; // 成功確定
       }
-    },
-    async (decodedText) => {
-      const code = String(decodedText || "").trim();
-      if (!code) return;
 
-      setStatus("JANコード読み取り成功: " + code);
-      await stop();
-      sendResult(code);
-    },
-    () => {}
-  );
+      // 前面濃厚 → 次のattemptへ
+      lastErr = new Error(`selected front camera on attempt=${a.name} label=${label || "(empty)"}`);
+      try { await stop(); } catch(_) {}
 
-  bindDoubleTapToZoom();
+    } catch (e) {
+      lastErr = e;
+      try { await stop(); } catch(_) {}
+    }
+  }
 
-  // 起動後にズーム/AF等を適用（少し待つ）
-  await new Promise(r => setTimeout(r, 160));
-  await applyEnhancements();
+  throw lastErr || new Error("failed to start camera");
 }
 
 async function start() {
@@ -264,10 +278,6 @@ async function start() {
       return;
     }
 
-    // ★重要：インスタンスを作り直す（iOSで前カメ固定になるのを回避しやすい）
-    try { if (qr) await stop(); } catch(_) {}
-    qr = new Html5Qrcode("reader", { verbose:false });
-
     zoomIndex = 0;
     setStatus("背面カメラを選択中…");
 
@@ -278,7 +288,8 @@ async function start() {
     }
 
     setStatus("カメラ起動中…（許可ダイアログが出たら許可）");
-    await startWithCameraId(bestId);
+
+    await startWithFallback(bestId);
 
     setStatus("バーコードを枠内に合わせてください（ダブルタップでズーム切替）");
 
