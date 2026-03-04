@@ -20,7 +20,7 @@ video { filter: contrast(1.45) brightness(1.12); }
 </head>
 
 <body>
-<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-08</div>
+<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-09</div>
 <div id="reader"></div>
 <div class="p" id="status">起動中…</div>
 
@@ -51,11 +51,12 @@ const formats = [
 
 let qr = null;
 let busy = false;
-let lastAcceptedAt = 0;
 let done = false;
+let lastAcceptedAt = 0;
 
-// 「再試行」で背面を取り直すためのトグル（ユーザー操作起点を作る）
-let forceBackOnRetry = true;
+// カメラ候補を保持して「再試行」で循環
+let cameraList = [];
+let cameraIndex = 0;
 
 function onlyDigits(s){ return /^[0-9]+$/.test(s); }
 
@@ -127,100 +128,83 @@ async function hardFinishAndReturn(code) {
   setStatus("SCAN: " + code + "（戻り先が無いのでこの画面で終了）");
 }
 
-async function tryApplyVideoTuning() {
+function lower(s){ return String(s || "").toLowerCase(); }
+
+// 背面らしさで並べ替え（ラベルが空でも後ろの方を優先）
+function orderPreferBack(cams) {
+  const keys = ["back","rear","environment","背面","アウト","外側"];
+  return cams
+    .map((c, i) => {
+      const l = lower(c.label);
+      let s = 0;
+      for (const k of keys) if (l.includes(k)) s += 100;
+      s += i; // 後ろにあるほど少し有利
+      return { c, s };
+    })
+    .sort((a,b) => b.s - a.s)
+    .map(x => x.c);
+}
+
+// いま掴んでいるカメラが内カメっぽいか判定（取れない環境もある）
+function isFrontCameraNow() {
   try {
     const video = document.querySelector("#reader video");
     const track = video?.srcObject?.getVideoTracks?.()[0];
-    if (!track) return;
+    if (!track) return false;
 
-    const caps = track.getCapabilities ? track.getCapabilities() : null;
-    if (!caps) return;
+    const settings = track.getSettings ? track.getSettings() : {};
+    const facing = lower(settings.facingMode);
+    const label = lower(track.label);
 
-    const advanced = [];
-    if (caps.focusMode && Array.isArray(caps.focusMode) && caps.focusMode.includes("continuous")) {
-      advanced.push({ focusMode: "continuous" });
-    }
-    if (caps.zoom) {
-      const min = caps.zoom.min;
-      const max = caps.zoom.max;
-      const z = Math.min(max, Math.max(min, min + (max - min) * 0.70));
-      advanced.push({ zoom: z });
-    }
-    if (advanced.length) {
-      await track.applyConstraints({ advanced });
-    }
-  } catch(_) {}
-}
+    if (facing === "user") return true;
+    if (facing === "environment") return false;
 
-// ---- ここが肝：背面要求を段階的に試す ----
-async function startWithPreference(preferBackStrong) {
-  if (!qr) qr = new Html5Qrcode("reader", { verbose:false });
+    if (label.includes("front") || label.includes("user") || label.includes("内") || label.includes("前面")) return true;
+    if (label.includes("back") || label.includes("rear") || label.includes("environment") || label.includes("背面")) return false;
 
-  // ① strongest: exact environment（通れば背面確定）
-  if (preferBackStrong) {
-    try {
-      await qr.start(
-        { facingMode: { exact: "environment" } }, // ✅トップレベル1キー
-        {
-          fps: 10,
-          qrbox: { width: 320, height: 80 },
-          formatsToSupport: formats,
-          disableFlip: false,
-          videoConstraints: { width: { ideal: 1920 }, height: { ideal: 1080 } }
-        },
-        async (decodedText) => {
-          if (done) return;
-          const now = Date.now();
-          if (now - lastAcceptedAt < 900) return;
-          const code = normalizeCode(decodedText);
-          if (!isValidJan(code)) return;
-          done = true;
-          lastAcceptedAt = now;
-          setStatus("JANコード読み取り成功: " + code);
-          await hardFinishAndReturn(code);
-        },
-        () => {}
-      );
-      setTimeout(tryApplyVideoTuning, 700);
-      return true;
-    } catch(_) {
-      // 次にフォールバック
-      await stopWithTimeout(800);
-    }
-  }
-
-  // ② fallback: environment（無視されることもあるが試す価値あり）
-  try {
-    await qr.start(
-      { facingMode: "environment" }, // ✅トップレベル1キー
-      {
-        fps: 10,
-        qrbox: { width: 320, height: 80 },
-        formatsToSupport: formats,
-        disableFlip: false,
-        videoConstraints: { width: { ideal: 1920 }, height: { ideal: 1080 } }
-      },
-      async (decodedText) => {
-        if (done) return;
-        const now = Date.now();
-        if (now - lastAcceptedAt < 900) return;
-        const code = normalizeCode(decodedText);
-        if (!isValidJan(code)) return;
-        done = true;
-        lastAcceptedAt = now;
-        setStatus("JANコード読み取り成功: " + code);
-        await hardFinishAndReturn(code);
-      },
-      () => {}
-    );
-    setTimeout(tryApplyVideoTuning, 700);
-    return true;
-  } catch(e) {
-    throw e;
+    return false; // 判定不能は「前と断定しない」
+  } catch(_) {
+    return false;
   }
 }
 
-async function start() {
+async function startWithCameraId(cameraId) {
+  await qr.start(
+    cameraId, // ✅deviceId文字列で指定（iOSで強い）
+    {
+      fps: 10,
+      qrbox: { width: 320, height: 80 },
+      formatsToSupport: formats,
+      disableFlip: false,
+      // videoConstraintsは入れてOK（deviceId指定と衝突しない）
+      videoConstraints: { width: { ideal: 1920 }, height: { ideal: 1080 } }
+    },
+    async (decodedText) => {
+      if (done) return;
+
+      const now = Date.now();
+      if (now - lastAcceptedAt < 900) return;
+
+      const code = normalizeCode(decodedText);
+      if (!isValidJan(code)) return;
+
+      done = true;
+      lastAcceptedAt = now;
+
+      setStatus("JANコード読み取り成功: " + code);
+      await hardFinishAndReturn(code);
+    },
+    () => {}
+  );
+}
+
+async function ensureCameraList() {
+  const cams = await Html5Qrcode.getCameras();
+  cameraList = orderPreferBack(cams || []);
+  cameraIndex = 0;
+}
+
+async function startSmart(preferBack = true) {
   if (busy) return;
   busy = true;
   done = false;
@@ -234,33 +218,43 @@ async function start() {
     if (!qr) qr = new Html5Qrcode("reader", { verbose:false });
     await stopWithTimeout(800);
 
-    setStatus("カメラ起動中…（許可ダイアログが出たら許可）");
+    setStatus("カメラ準備中…（許可ダイアログが出たら許可）");
 
-    // 初回は「強い背面要求」をON
-    await startWithPreference(true);
+    await ensureCameraList();
+    if (!cameraList.length) {
+      setStatus("カメラが見つかりませんでした（権限/端末を確認）", true);
+      return;
+    }
 
-    setStatus("バーコードを枠内に合わせてください\n※内カメのままなら「再試行」を1回押してください");
+    // ✅ まず背面候補から試す。内カメっぽければ次へ（最大2回）
+    const tries = Math.min(2, cameraList.length);
+    for (let i = 0; i < tries; i++) {
+      await stopWithTimeout(800);
+      const cam = cameraList[cameraIndex % cameraList.length];
+      setStatus(`カメラ起動中…（候補${cameraIndex+1}/${cameraList.length}）`);
+      await startWithCameraId(cam.id);
+
+      // 少し待って内カメ判定
+      await new Promise(r => setTimeout(r, 600));
+
+      if (preferBack && isFrontCameraNow() && cameraList.length > 1) {
+        cameraIndex++; // 次へ
+        continue;
+      }
+      setStatus("バーコードを枠内に合わせてください\n（内カメなら「再試行」で切替）");
+      return;
+    }
+
+    // ここまで来たら判定不能/固定など。とりあえず起動済み
+    setStatus("バーコードを枠内に合わせてください\n（内カメなら「再試行」で切替）");
 
   } catch(e) {
     const name = (e && e.name) || "Error";
     const msg  = (e && e.message) || String(e);
-
-    // exact環境が取れない/拒否されたケース
-    if (name === "OverconstrainedError" || name === "NotFoundError") {
-      setStatus(
-        "背面カメラを起動できませんでした。\n" +
-        "（Slack内ブラウザ等では端末側の都合で内カメになることがあります）\n" +
-        "【対処】「再試行」を押して背面を取り直してください。\n" +
-        "それでもダメな場合は共有ボタン→Safariで開く。",
-        true
-      );
-      return;
-    }
-
     setStatus(
       "起動失敗: " + name + " / " + msg +
       "\n・Safariのカメラ許可がONか確認" +
-      "\n・別アプリでカメラ使用中だと失敗します",
+      "\n・他アプリでカメラ使用中だと失敗します",
       true
     );
   } finally {
@@ -268,28 +262,13 @@ async function start() {
   }
 }
 
-// ✅ 再試行は “ユーザー操作起点” で背面を取り直す（これがWKWebViewで効きやすい）
+// ✅ 再試行：カメラを1つ進めて起動し直す（ユーザー操作起点）
 document.getElementById("retry").addEventListener("click", async () => {
   if (busy) return;
-  busy = true;
-  done = false;
   try {
-    await stopWithTimeout(800);
-    setStatus("背面カメラで再起動中…");
-    // 再試行時は exact を必ず試す（ユーザー操作なので通りやすい）
-    await startWithPreference(true);
-    setStatus("バーコードを枠内に合わせてください");
-  } catch(e) {
-    const name = (e && e.name) || "Error";
-    const msg  = (e && e.message) || String(e);
-    setStatus(
-      "再試行失敗: " + name + " / " + msg +
-      "\n・共有ボタン→Safariで開くが最も確実です",
-      true
-    );
-  } finally {
-    busy = false;
-  }
+    cameraIndex++;
+    await startSmart(false); // 判定で戻さず、次候補をそのまま使う
+  } catch(_) {}
 });
 
 document.getElementById("cancel").addEventListener("click", async () => {
@@ -299,7 +278,7 @@ document.getElementById("cancel").addEventListener("click", async () => {
   if (returnUrl) location.href = returnUrl;
 });
 
-start();
+startSmart(true);
 </script>
 </body>
 </html>
