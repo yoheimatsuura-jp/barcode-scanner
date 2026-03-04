@@ -15,12 +15,12 @@ button { border:0; border-radius:10px; padding:12px; font-weight:900; font-size:
 .pri { background:#0f766e; color:#fff; }
 .sub { background:#e5e7eb; color:#111827; }
 .err { color:#fecaca; }
-video { filter: contrast(1.45) brightness(1.12); }
+video { filter: contrast(1.4) brightness(1.1); }
 </style>
 </head>
 
 <body>
-<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-10</div>
+<div class="head">外部ライブスキャナ（JAN専用） BUILD: 2026-03-04-09</div>
 <div id="reader"></div>
 <div class="p" id="status">起動中…</div>
 
@@ -38,176 +38,107 @@ const tab = qs.get("tab") || "";
 const returnOrigin = qs.get("returnOrigin") || "*";
 const returnUrl = qs.get("returnUrl") || "";
 
+/* ===== JANコードのみ ===== */
+const formats = [
+  Html5QrcodeSupportedFormats.EAN_13,
+  Html5QrcodeSupportedFormats.EAN_8,
+];
+
 const statusEl = document.getElementById("status");
 const setStatus = (t, err=false) => {
   statusEl.textContent = t;
   statusEl.className = "p" + (err ? " err" : "");
 };
 
-const formats = [
-  Html5QrcodeSupportedFormats.EAN_13,
-  Html5QrcodeSupportedFormats.EAN_8,
-];
-
 let qr = null;
 let busy = false;
-let done = false;
-let lastAcceptedAt = 0;
 
-let cameraList = [];
-let cameraIndex = 0; // 0..len-1
-
-function onlyDigits(s){ return /^[0-9]+$/.test(s); }
-
-function eanChecksumOK(code) {
-  if (!onlyDigits(code)) return false;
-  const len = code.length;
-  if (len !== 13 && len !== 8) return false;
-
-  const digits = code.split("").map(d => Number(d));
-  const check = digits[len - 1];
-  const body = digits.slice(0, len - 1);
-
-  let sum = 0;
-  for (let i = body.length - 1, w3 = true; i >= 0; i--, w3 = !w3) {
-    sum += body[i] * (w3 ? 3 : 1);
-  }
-  const calc = (10 - (sum % 10)) % 10;
-  return calc === check;
-}
-
-function normalizeCode(decodedText) {
-  return String(decodedText || "").trim().replace(/\D/g, "");
-}
-function isValidJan(code) {
-  if (!(code.length === 13 || code.length === 8)) return false;
-  return eanChecksumOK(code);
-}
-
-function buildReturnUrlWithCode(code) {
-  if (!returnUrl) return "";
-  const u = new URL(returnUrl);
-  u.searchParams.set("tab", tab);
-  u.searchParams.set("target", target);
-  u.searchParams.set("code", code);
-  return u.toString();
-}
-
-async function stopWithTimeout(ms = 1200) {
-  if (!qr) return;
-  const timeout = new Promise((resolve) => setTimeout(resolve, ms));
-  const stopper = (async () => {
-    try { if (qr.isScanning) await qr.stop(); } catch(_) {}
-    try { await qr.clear(); } catch(_) {}
-  })();
-  await Promise.race([stopper, timeout]);
-}
-
-async function hardFinishAndReturn(code) {
-  setStatus("読み取り完了。戻ります…");
-  await stopWithTimeout(1200);
-
+function sendResult(code) {
   const payload = { type:"barcode", code, target, tab };
 
   if (window.opener) {
     try {
       window.opener.postMessage(payload, returnOrigin);
-      try { window.close(); } catch(_) {}
-      setTimeout(() => {
-        if (returnUrl) location.href = buildReturnUrlWithCode(code);
-      }, 150);
+      window.close();
       return;
-    } catch(_) {
-      if (returnUrl) { location.href = buildReturnUrlWithCode(code); return; }
-    }
-  }
-
-  if (returnUrl) { location.href = buildReturnUrlWithCode(code); return; }
-  setStatus("SCAN: " + code + "（戻り先が無いのでこの画面で終了）");
-}
-
-function lower(s){ return String(s || "").toLowerCase(); }
-
-// 背面っぽいラベルを優先。ラベルが空の場合も「後ろの方」を少し優先。
-function orderPreferBack(cams) {
-  const keys = ["back","rear","environment","背面","アウト","外側"];
-  return (cams || [])
-    .map((c, i) => {
-      const l = lower(c.label);
-      let score = 0;
-      for (const k of keys) if (l.includes(k)) score += 100;
-      score += i; // 後ろほどわずかに有利
-      return { c, score };
-    })
-    .sort((a,b) => b.score - a.score)
-    .map(x => x.c);
-}
-
-// ✅ iOS/WKWebView で label/複数カメラ列挙を安定させるために、先に許可を確定させる
-async function preflightPermission() {
-  if (!navigator.mediaDevices?.getUserMedia) return;
-  let stream = null;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-  } finally {
-    try {
-      stream?.getTracks?.().forEach(t => t.stop());
     } catch(_) {}
   }
+
+  if (returnUrl) {
+    const u = new URL(returnUrl);
+    u.searchParams.set("tab", tab);
+    u.searchParams.set("target", target);
+    u.searchParams.set("code", code);
+    location.href = u.toString();
+    return;
+  }
+
+  alert("SCAN: " + code);
 }
 
-function diagLine(extra="") {
-  const ua = navigator.userAgent || "";
-  const inSlack = /Slack/i.test(ua);
-  const camCount = cameraList.length;
-  const idx = camCount ? (cameraIndex % camCount) + 1 : 0;
-  return `\n[diag] cams=${camCount} use=${idx}/${camCount} inSlack=${inSlack}${extra ? " " + extra : ""}`;
+async function stop() {
+  if (!qr) return;
+  try { if (qr.isScanning) await qr.stop(); } catch(_) {}
+  try { await qr.clear(); } catch(_) {}
 }
 
-async function ensureCameraList() {
-  // 1) 許可確定 → 2) getCameras
-  await preflightPermission();
-  const cams = await Html5Qrcode.getCameras();
-  cameraList = orderPreferBack(cams);
-  if (!cameraList.length) return;
+function pickBackCamera(cams) {
+  if (!Array.isArray(cams) || cams.length === 0) return null;
 
-  // indexが範囲外になってたら正規化
-  cameraIndex = cameraIndex % cameraList.length;
+  const score = (label) => {
+    const s = (label || "").toLowerCase();
+    // iOS / 日本語も含めて背面っぽい語を優先
+    const hits = [
+      "back", "rear", "environment", "wide", "ultra", "tele",
+      "背面", "アウト", "外側", "後", "リア"
+    ];
+    let p = 0;
+    for (const h of hits) if (s.includes(h)) p += 10;
+    // frontっぽい語は減点
+    const bad = ["front", "user", "selfie", "前面", "イン", "内側"];
+    for (const b of bad) if (s.includes(b)) p -= 50;
+    return p;
+  };
+
+  // ラベルでスコアリングして最大を採用
+  const sorted = cams.slice().sort((a,b) => score(b.label) - score(a.label));
+  return sorted[0]?.id || cams[0].id;
+}
+
+async function getCamerasSafely() {
+  // html5-qrcode は許可前だと label が空のことがある
+  // ただ cams 自体は取れるのでまず取得 → 後で許可後に再取得して改善
+  try {
+    return await Html5Qrcode.getCameras();
+  } catch (_) {
+    return [];
+  }
 }
 
 async function startWithCameraId(cameraId) {
   await qr.start(
-    cameraId, // deviceId string
+    cameraId, // ★ここがポイント：facingModeではなくcameraIdで指定
     {
-      fps: 10,
-      qrbox: { width: 320, height: 80 },
+      fps: 15,
+      qrbox: { width: 320, height: 140 }, // 横長（JAN最適）
       formatsToSupport: formats,
-      disableFlip: false,
-      videoConstraints: { width: { ideal: 1920 }, height: { ideal: 1080 } }
+      disableFlip: true,
     },
     async (decodedText) => {
-      if (done) return;
+      const code = String(decodedText || "").trim();
+      if (!code) return;
 
-      const now = Date.now();
-      if (now - lastAcceptedAt < 900) return;
-
-      const code = normalizeCode(decodedText);
-      if (!isValidJan(code)) return;
-
-      done = true;
-      lastAcceptedAt = now;
-
-      setStatus("JANコード読み取り成功: " + code + diagLine());
-      await hardFinishAndReturn(code);
+      setStatus("JANコード読み取り成功: " + code);
+      await stop();
+      sendResult(code);
     },
     () => {}
   );
 }
 
-async function startSmart() {
+async function start() {
   if (busy) return;
   busy = true;
-  done = false;
 
   try {
     if (!window.isSecureContext) {
@@ -216,52 +147,58 @@ async function startSmart() {
     }
 
     if (!qr) qr = new Html5Qrcode("reader", { verbose:false });
-    await stopWithTimeout(800);
+    await stop();
 
-    setStatus("カメラ準備中…（許可ダイアログが出たら許可）");
+    setStatus("カメラ起動中…（許可ダイアログが出たら許可）");
 
-    await ensureCameraList();
-    if (!cameraList.length) {
-      setStatus("カメラ候補を取得できませんでした。\n・iPhoneの設定でカメラ許可を確認\n・一度ページをリロード\n" + diagLine(), true);
+    // 1) まずカメラ一覧取得（許可前でも取れることがある）
+    let cams = await getCamerasSafely();
+    let picked = pickBackCamera(cams);
+
+    // 2) もし label が空っぽだらけ等で選べない/片寄る場合、
+    //    一度 facingMode environment で「許可だけ通す」→ cams再取得 → cameraIdで起動し直す
+    if (!picked) {
+      // 最終手段：まず environment で起動を試す（許可目的）
+      await qr.start(
+        { facingMode: "environment" },
+        { fps: 15, qrbox: { width: 320, height: 140 }, formatsToSupport: formats, disableFlip:true },
+        () => {},
+        () => {}
+      );
+      await stop();
+      cams = await getCamerasSafely();
+      picked = pickBackCamera(cams);
+    }
+
+    if (!picked) {
+      setStatus("カメラが取得できませんでした。Safariのカメラ許可を確認してください。", true);
       return;
     }
 
-    const cam = cameraList[cameraIndex % cameraList.length];
-    const labelHint = cam.label ? ` label=${cam.label}` : "";
-    setStatus("カメラ起動中…" + diagLine(labelHint));
-
-    await startWithCameraId(cam.id);
-
-    setStatus(
-      "バーコードを枠内に合わせてください\n" +
-      "※内カメのままなら「再試行」を押してください" +
-      diagLine(labelHint)
-    );
+    // 3) cameraIdで背面を強制起動
+    await startWithCameraId(picked);
+    setStatus("バーコードを枠内に合わせてください");
 
   } catch(e) {
-    const name = (e && e.name) || "Error";
-    const msg  = (e && e.message) || String(e);
-    setStatus("起動失敗: " + name + " / " + msg + diagLine(), true);
+    setStatus(
+      "起動失敗: " + ((e && e.name) || "Error") + " / " + ((e && e.message) || e) +
+      "\n・Safariのサイト設定でカメラ許可をON" +
+      "\n・別タブでカメラを使っているアプリがあれば閉じる",
+      true
+    );
   } finally {
     busy = false;
   }
 }
 
-// ✅ 再試行：候補を進めて起動し直す
-document.getElementById("retry").addEventListener("click", async () => {
-  if (busy) return;
-  cameraIndex++;
-  await startSmart();
-});
-
+document.getElementById("retry").addEventListener("click", start);
 document.getElementById("cancel").addEventListener("click", async () => {
-  done = true;
-  await stopWithTimeout(800);
-  try { window.close(); } catch(_) {}
+  await stop();
+  window.close();
   if (returnUrl) location.href = returnUrl;
 });
 
-startSmart();
+start();
 </script>
 </body>
 </html>
