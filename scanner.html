@@ -101,18 +101,26 @@ async function start() {
 
     setStatus("カメラ起動中…（許可ダイアログが出たら許可）");
 
+    // ✅ 修正点：
+    // html5-qrcode の start() 第1引数(cameraIdOrConfig) は
+    // 「文字列カメラID」または「キーが1つだけのオブジェクト」しか許可されません。
+    // ここで width/height を入れると今回のエラーになります。
+    //
+    // width/height 等の制約は第2引数(config)に寄せるのが安全です。
     await qr.start(
-      {
-        facingMode: "environment",
-        width: { ideal:1280 },
-        height: { ideal:720 }
-      },
+      { facingMode: "environment" },   // ← キー1つだけにする
       {
         fps:15,
         qrbox:{ width:320, height:140 },   // 横長（JAN最適）
         formatsToSupport:formats,
         aspectRatio:1.777,
-        disableFlip:true
+        disableFlip:true,
+
+        // 可能なら解像度の希望はここに寄せる（未対応端末もあるので「理想値」程度に）
+        videoConstraints: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
       },
       async (decodedText) => {
         const code = String(decodedText || "").trim();
