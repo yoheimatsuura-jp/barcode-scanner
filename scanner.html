@@ -1,40 +1,240 @@
 <!doctype html>
 <html lang="ja">
 <head>
-	<meta charset="utf-8" />
-	<meta name="viewport" content="width=device-width, initial-scale=1" />
-	<title>Scanner</title>
-	<style>
-		body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#0b0f0e; color:#fff; }
-		.head { padding:12px 14px; background:#111827; font-weight:800; }
-		#reader { width:100%; min-height:70vh; background:#000; }
-		.p { padding:12px 14px; font-size:14px; color:#cbd5e1; white-space:pre-wrap; }
-		.btns { display:grid; gap:10px; padding:12px 14px; }
-		button { border:0; border-radius:10px; padding:12px; font-weight:900; font-size:16px; }
-		.pri { background:#0f766e; color:#fff; }
-		.sub { background:#e5e7eb; color:#111827; }
-		.err { color:#fecaca; }
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Scanner</title>
+  <style>
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#0b0f0e; color:#fff; }
+    .head { padding:12px 14px; background:#111827; font-weight:800; }
+    #reader { width:100%; min-height:70vh; background:#000; }
+    .p { padding:12px 14px; font-size:14px; color:#cbd5e1; white-space:pre-wrap; }
+    .btns { display:grid; gap:10px; padding:12px 14px; }
+    button { border:0; border-radius:10px; padding:12px; font-weight:900; font-size:16px; }
+    .pri { background:#0f766e; color:#fff; }
+    .sub { background:#e5e7eb; color:#111827; }
+    .err { color:#fecaca; }
 
-		/* ▼追加（見た目は既存の雰囲気に寄せて最小限） */
-		.zoomRow { padding: 0 14px 10px; color:#cbd5e1; }
-		.zoomTop { display:flex; align-items:center; justify-content:space-between; font-size:14px; padding: 8px 0; }
-		#zoom { width:100%; }
-	</style>
+    /* ズームUI */
+    .zoomRow { padding: 0 14px 10px; color:#cbd5e1; }
+    .zoomTop { display:flex; align-items:center; justify-content:space-between; font-size:14px; padding: 8px 0; }
+    #zoom { width:100%; }
+  </style>
 </head>
 <body>
-	<div class="head">外部ライブスキャナ</div>
-	<div id="reader"></div>
-	<div class="p" id="status">起動中…</div>
+  <div class="head">外部ライブスキャナ</div>
+  <div id="reader"></div>
+  <div class="p" id="status">起動中…</div>
 
-	<!-- ▼追加：ズームUI（対応端末のときだけ表示） -->
-	<div class="zoomRow" id="zoomWrap" style="display:none;">
-		<div class="zoomTop">
-			<div>ズーム</div>
-			<div><span id="zoomVal">1.0</span>x</div>
-		</div>
-		<input id="zoom" type="range" min="1" max="1" step="0.1" value="1" />
-	</div>
+  <div class="zoomRow" id="zoomWrap" style="display:none;">
+    <div class="zoomTop">
+      <div>ズーム</div>
+      <div><span id="zoomVal">1.0</span>x</div>
+    </div>
+    <input id="zoom" type="range" min="1" max="1" step="0.1" value="1" />
+  </div>
 
+  <div class="btns">
+    <button class="pri" id="retry" type="button">再試行</button>
+    <button class="sub" id="cancel" type="button">キャンセル</button>
+  </div>
+
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <script>
+    const qs = new URLSearchParams(location.search);
+    const target = qs.get("target") || "";
+    const tab = qs.get("tab") || "";
+    const returnOrigin = qs.get("returnOrigin") || "*";
+    const returnUrl = qs.get("returnUrl") || "";
+
+    const statusEl = document.getElementById("status");
+    const setStatus = (t, err = false) => {
+      statusEl.textContent = t;
+      statusEl.className = "p" + (err ? " err" : "");
+    };
+
+    // JAN/EAN中心（必要なら増やしてOK）
+    const formats = [
+      Html5QrcodeSupportedFormats.EAN_13,
+      Html5QrcodeSupportedFormats.EAN_8,
+      Html5QrcodeSupportedFormats.UPC_A,
+      Html5QrcodeSupportedFormats.UPC_E,
+      Html5QrcodeSupportedFormats.CODE_128,
+      Html5QrcodeSupportedFormats.CODE_39,
+      Html5QrcodeSupportedFormats.ITF,
+    ];
+
+    let qr = null;
+    let busy = false;
+
+    const zoomWrap = document.getElementById("zoomWrap");
+    const zoomInput = document.getElementById("zoom");
+    const zoomVal = document.getElementById("zoomVal");
+    let zoomSupported = false;
+    let zoomApplyTimer = null;
+
+    function sendResult(code) {
+      const payload = { type: "barcode", code, target, tab };
+
+      if (window.opener) {
+        try {
+          window.opener.postMessage(payload, returnOrigin);
+          window.close();
+          return;
+        } catch (_) {}
+      }
+
+      if (returnUrl) {
+        const u = new URL(returnUrl);
+        u.searchParams.set("tab", tab);
+        u.searchParams.set("target", target);
+        u.searchParams.set("code", code);
+        location.href = u.toString();
+        return;
+      }
+
+      alert("SCAN: " + code);
+    }
+
+    // 1Dバーコードは「横長枠」の方が安定しやすい（縦持ちでも読みやすくなる）
+    function calcQrBox(viewW, viewH) {
+      // 画面幅に対して大きめに（バーの本数＝水平解像度を確保）
+      const w = Math.max(260, Math.floor(Math.min(viewW * 0.92, 520)));
+      const h = Math.max(180, Math.floor(w * 0.55)); // 横長
+      return { width: w, height: h };
+    }
+
+    async function stop() {
+      if (!qr) return;
+      try { if (qr.isScanning) await qr.stop(); } catch (_) {}
+      try { await qr.clear(); } catch (_) {}
+
+      zoomWrap.style.display = "none";
+      zoomSupported = false;
+    }
+
+    function setupZoomUI() {
+      try {
+        const caps = qr.getRunningTrackCapabilities && qr.getRunningTrackCapabilities();
+        if (!caps || !caps.zoom) {
+          zoomWrap.style.display = "none";
+          zoomSupported = false;
+          return;
+        }
+        zoomSupported = true;
+
+        const z = caps.zoom;
+        const min = (typeof z.min === "number") ? z.min : 1;
+        const max = (typeof z.max === "number") ? z.max : 1;
+        const step = (typeof z.step === "number" && z.step > 0) ? z.step : 0.1;
+
+        zoomInput.min = String(min);
+        zoomInput.max = String(max);
+        zoomInput.step = String(step);
+
+        let current = min;
+        try {
+          const st = qr.getRunningTrackSettings && qr.getRunningTrackSettings();
+          if (st && typeof st.zoom === "number") current = st.zoom;
+        } catch (_) {}
+
+        current = Math.max(min, Math.min(max, current));
+        zoomInput.value = String(current);
+        zoomVal.textContent = Number(current).toFixed(1);
+        zoomWrap.style.display = "block";
+      } catch (_) {
+        zoomWrap.style.display = "none";
+        zoomSupported = false;
+      }
+    }
+
+    async function applyZoom(value) {
+      if (!qr || !zoomSupported) return;
+      const v = Number(value);
+      if (!Number.isFinite(v)) return;
+
+      zoomVal.textContent = v.toFixed(1);
+      try {
+        await qr.applyVideoConstraints({ advanced: [{ zoom: v }] });
+      } catch (_) {}
+    }
+
+    zoomInput.addEventListener("input", () => {
+      if (zoomApplyTimer) clearTimeout(zoomApplyTimer);
+      const v = zoomInput.value;
+      zoomApplyTimer = setTimeout(() => applyZoom(v), 60);
+    });
+
+    async function start() {
+      if (busy) return;
+      busy = true;
+
+      try {
+        if (!window.isSecureContext) {
+          setStatus("HTTPSで開いてください（カメラはHTTPS必須）", true);
+          return;
+        }
+
+        if (!qr) qr = new Html5Qrcode("reader", { verbose: false });
+        await stop();
+
+        setStatus("カメラ起動中…（許可ダイアログが出たら許可）");
+
+        // ✅ 縦向きで失敗しがちな原因＝解像度不足を潰す
+        // できる端末では高解像度を要求（無視されてもOK）
+        const videoConstraints = {
+          facingMode: "environment",
+          width:  { ideal: 1920 },
+          height: { ideal: 1080 },
+          // iPhone Safariは厳密に効かないこともあるが、効く端末では大きく改善
+        };
+
+        // ✅ BarcodeDetectorが使える環境は回転耐性が強いので優先（縦JANが通りやすい）
+        const config = {
+          fps: 12,
+          qrbox: calcQrBox,
+          formatsToSupport: formats,
+          disableFlip: false,
+          experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+        };
+
+        await qr.start(
+          videoConstraints,
+          config,
+          (decodedText) => {
+            const code = String(decodedText || "").trim();
+            if (!code) return;
+            setStatus(`スキャン成功: ${code}`);
+            sendResult(code);
+          },
+          () => {}
+        );
+
+        setupZoomUI();
+        setStatus("バーコードを枠内に合わせてください（縦/横どちらでもOK）");
+      } catch (e) {
+        setStatus(
+          `起動失敗: ${(e && e.name) || "Error"} / ${(e && e.message) || e}\n` +
+          `・ブラウザのカメラ許可ON\n・LINE等のアプリ内ブラウザではなくChrome/Safariで開く\n` +
+          `・端末を再起動/タブを閉じて再試行`,
+          true
+        );
+      } finally {
+        busy = false;
+      }
+    }
+
+    document.getElementById("retry").addEventListener("click", start);
+    document.getElementById("cancel").addEventListener("click", async () => {
+      await stop();
+      window.close();
+      if (returnUrl) location.href = returnUrl;
+    });
+
+    start();
+  </script>
+</body>
+</html>
 	<div class="btns">
 		<button class="pri" id="retry" type="button">再試行</button>
 		<button class="sub" id="cancel" type="button">キャンセル</button>
