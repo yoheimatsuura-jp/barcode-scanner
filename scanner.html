@@ -147,14 +147,17 @@
       statusEl.className = "p" + (isError ? " err" : "");
     };
 
+    let codeReader = null;
+    let controls = null;
     let stream = null;
-    let scanTimer = null;
-    let scanBusy = false;
     let busy = false;
     let sending = false;
     let restartTimer = null;
     let zoomSupported = false;
     let zoomApplyTimer = null;
+
+    let rotatedScanTimer = null;
+    let rotatedScanBusy = false;
 
     const hints = new Map();
     hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
@@ -168,8 +171,8 @@
     ]);
     hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
 
-    const reader = new ZXing.MultiFormatReader();
-    reader.setHints(hints);
+    const fallbackReader = new ZXing.MultiFormatReader();
+    fallbackReader.setHints(hints);
 
     function sendResult(code) {
       if (sending) return;
@@ -200,10 +203,24 @@
     }
 
     async function stop() {
-      if (scanTimer) {
-        clearInterval(scanTimer);
-        scanTimer = null;
+      if (rotatedScanTimer) {
+        clearInterval(rotatedScanTimer);
+        rotatedScanTimer = null;
       }
+
+      try {
+        if (controls && typeof controls.stop === "function") {
+          controls.stop();
+        }
+      } catch (_) {}
+
+      controls = null;
+
+      try {
+        if (codeReader && typeof codeReader.reset === "function") {
+          codeReader.reset();
+        }
+      } catch (_) {}
 
       try {
         if (videoEl) videoEl.pause();
@@ -347,7 +364,6 @@
       const vh = video.videoHeight || 0;
       if (!vw || !vh) return null;
 
-      // 正方形ガイドより少し広めに見る
       const size = Math.floor(Math.min(vw, vh) * 0.82);
       const sx = Math.max(0, Math.floor((vw - size) / 2));
       const sy = Math.max(0, Math.floor((vh - size) / 2));
@@ -393,6 +409,54 @@
       return canvas;
     }
 
+    function decodeCanvasWithZXing(canvas) {
+      if (!canvas) return "";
+
+      try {
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        const w = canvas.width;
+        const h = canvas.height;
+        const imageData = ctx.getImageData(0, 0, w, h);
+        const luminance = new ZXing.RGBLuminanceSource(imageData.data, w, h);
+        const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
+        const result = fallbackReader.decode(bitmap);
+        return result && result.getText ? String(result.getText()).trim() : "";
+      } catch (_) {
+        return "";
+      } finally {
+        try { fallbackReader.reset(); } catch (_) {}
+      }
+    }
+
+    async function tryRotatedFallbackScan() {
+      if (rotatedScanBusy || sending) return;
+      if (!videoEl || videoEl.readyState < 2) return;
+
+      rotatedScanBusy = true;
+      try {
+        const rotations = [90, 270, 180];
+        for (const deg of rotations) {
+          const canvas = drawCropToCanvas(videoEl, deg);
+          const code = decodeCanvasWithZXing(canvas);
+          if (code) {
+            setStatus(`スキャン成功: ${code}`);
+            try { await stop(); } catch (_) {}
+            sendResult(code);
+            return;
+          }
+        }
+      } finally {
+        rotatedScanBusy = false;
+      }
+    }
+
+    function startRotatedFallbackLoop() {
+      if (rotatedScanTimer) clearInterval(rotatedScanTimer);
+      rotatedScanTimer = setInterval(() => {
+        tryRotatedFallbackScan();
+      }, 400);
+    }
+
     async function start() {
       if (busy) return;
       busy = true;
@@ -415,26 +479,25 @@
         const cameraId = await resolveCameraId();
 
         codeReader = new ZXing.BrowserMultiFormatReader();
-        
+
         controls = await codeReader.decodeFromVideoDevice(
           cameraId,
           videoEl,
           async (result, err) => {
-            
             if (result) {
               const text = String(result.getText()).trim();
               if (!text || sending) return;
-              
+
               setStatus(`スキャン成功: ${text}`);
-              await stop();
+              try { await stop(); } catch (_) {}
               sendResult(text);
               return;
             }
-            
+
+            // 通常読取で見つからないときだけ補助読取
             if (!result && !sending) {
               tryRotatedFallbackScan();
             }
-          
           }
         );
 
