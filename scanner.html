@@ -18,14 +18,13 @@
     .zoomTop { display:flex; align-items:center; justify-content:space-between; font-size:14px; padding:8px 0; }
     #zoom { width:100%; }
 
-    /* 見た目だけのガイド。スキャン領域自体は制限しない */
     .guide {
       position:absolute;
       left:50%;
       top:50%;
       transform:translate(-50%, -50%);
-      width:min(88vw, 420px);
-      height:min(56vh, 320px);
+      width:min(90vw, 460px);
+      height:min(60vh, 340px);
       border:2px solid rgba(255,255,255,.78);
       border-radius:18px;
       pointer-events:none;
@@ -35,8 +34,8 @@
     .guide:after {
       content:"";
       position:absolute;
-      left:12%;
-      right:12%;
+      left:10%;
+      right:10%;
       height:1px;
       background:rgba(255,255,255,.18);
     }
@@ -46,9 +45,7 @@
 </head>
 <body>
   <div class="head">外部JANスキャナ</div>
-  <div id="reader">
-    <div class="guide"></div>
-  </div>
+  <div id="reader"><div class="guide"></div></div>
   <div class="p" id="status">起動中…</div>
 
   <div class="zoomRow" id="zoomWrap" style="display:none;">
@@ -78,13 +75,16 @@
       statusEl.className = "p" + (err ? " err" : "");
     };
 
-    // JAN だけに絞る（13桁 / 8桁）
-    const formats = [
+    const JAN_FORMATS = [
       Html5QrcodeSupportedFormats.EAN_13,
       Html5QrcodeSupportedFormats.EAN_8,
     ];
 
-    const isiPhone = /iPhone|iPod/i.test(navigator.userAgent);
+    const ua = navigator.userAgent || "";
+    const isiPhone = /iPhone|iPod/i.test(ua);
+    const isiPad = /iPad/i.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    const isIOS = isiPhone || isiPad;
+
     let qr = null;
     let busy = false;
 
@@ -116,6 +116,10 @@
       }
 
       alert("SCAN: " + code);
+    }
+
+    function isJan(code) {
+      return /^\d{8}$/.test(code) || /^\d{13}$/.test(code);
     }
 
     async function stop() {
@@ -174,7 +178,6 @@
 
     async function applyPreferredCameraTuning() {
       if (!qr) return;
-
       try {
         const caps = qr.getRunningTrackCapabilities && qr.getRunningTrackCapabilities();
         if (!caps) return;
@@ -188,8 +191,7 @@
         if (caps.zoom) {
           const min = (typeof caps.zoom.min === "number") ? caps.zoom.min : 1;
           const max = (typeof caps.zoom.max === "number") ? caps.zoom.max : 1;
-          const initial = isiPhone ? Math.min(max, Math.max(min, 1.4)) : min;
-
+          const initial = isIOS ? Math.min(max, Math.max(min, 1.4)) : Math.min(max, Math.max(min, 1.1));
           if (max > min) {
             advanced.push({ zoom: initial });
             zoomInput.value = String(initial);
@@ -207,7 +209,6 @@
       if (!qr || !zoomSupported) return;
       const v = Number(value);
       if (!Number.isFinite(v)) return;
-
       zoomVal.textContent = v.toFixed(1);
       await applyVideoConstraintsSafe({ advanced: [{ zoom: v }] });
     }
@@ -217,10 +218,6 @@
       const v = zoomInput.value;
       zoomApplyTimer = setTimeout(() => applyZoom(v), 60);
     });
-
-    function isJan(code) {
-      return /^\d{8}$/.test(code) || /^\d{13}$/.test(code);
-    }
 
     async function start() {
       if (busy) return;
@@ -235,7 +232,9 @@
         if (!qr) {
           qr = new Html5Qrcode("reader", {
             verbose: false,
-            useBarCodeDetectorIfSupported: false,
+            formatsToSupport: JAN_FORMATS,
+            // iPhone Safari は BarcodeDetector 相性が悪いことがあるため iOS だけ無効化
+            useBarCodeDetectorIfSupported: !isIOS,
           });
         }
 
@@ -245,11 +244,11 @@
         await qr.start(
           { facingMode: "environment" },
           {
-            fps: isiPhone ? 8 : 10,
+            fps: isIOS ? 8 : 10,
             aspectRatio: 4 / 3,
-            // qrbox を設定しない → 画面全体を読むので横向き・縦向き両対応にしやすい
-            disableFlip: true,
-            formatsToSupport: formats,
+            // qrbox を固定しない → 画面全体を読む
+            // disableFlip は false が安全。PC のミラー映像でも読めるようにする
+            disableFlip: false,
           },
           async (decodedText) => {
             const code = String(decodedText || "").trim();
@@ -267,7 +266,7 @@
       } catch (e) {
         setStatus(
           `起動失敗: ${(e && e.name) || "Error"} / ${(e && e.message) || e}\n` +
-          `・ブラウザのカメラ許可ON\n・LINE等のアプリ内ブラウザではなくSafariで開く`,
+          `・ブラウザのカメラ許可ON\n・PCはChrome推奨 / iPhoneはSafari推奨`,
           true
         );
       } finally {
