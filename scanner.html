@@ -1,472 +1,497 @@
 <!doctype html>
 <html lang="ja">
 <head>
-	<meta charset="utf-8" />
-	<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-	<title>Scanner</title>
-	<style>
-		body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#0b0f0e; color:#fff; }
-		.head { padding:12px 14px; background:#111827; font-weight:800; }
-		#reader { width:100%; min-height:70vh; background:#000; }
-		.p { padding:12px 14px; font-size:14px; color:#cbd5e1; white-space:pre-wrap; }
-		.btns { display:grid; gap:10px; padding:12px 14px; }
-		button { border:0; border-radius:10px; padding:12px; font-weight:900; font-size:16px; }
-		.pri { background:#0f766e; color:#fff; }
-		.sub { background:#e5e7eb; color:#111827; }
-		.err { color:#fecaca; }
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Scanner</title>
+  <style>
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#0b0f0e; color:#fff; }
+    .head { padding:12px 14px; background:#111827; font-weight:800; }
+    #readerWrap {
+      position: relative;
+      width: 100%;
+      min-height: 70vh;
+      background: #000;
+      overflow: hidden;
+    }
+    #video {
+      width: 100%;
+      height: 70vh;
+      object-fit: cover;
+      background: #000;
+      display: block;
+    }
+    /* 正方形ガイド */
+    #guide {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      width: min(68vw, 260px);
+      height: min(68vw, 260px);
+      border: 3px solid rgba(255,255,255,.95);
+      border-radius: 16px;
+      box-shadow: 0 0 0 9999px rgba(0,0,0,.18);
+      pointer-events: none;
+    }
 
-		.zoomRow { padding: 0 14px 10px; color:#cbd5e1; }
-		.zoomTop { display:flex; align-items:center; justify-content:space-between; font-size:14px; padding: 8px 0; }
-		#zoom { width:100%; }
+    .p { padding:12px 14px; font-size:14px; color:#cbd5e1; white-space:pre-wrap; }
+    .btns { display:grid; gap:10px; padding:12px 14px; }
+    button { border:0; border-radius:10px; padding:12px; font-weight:900; font-size:16px; }
+    .pri { background:#0f766e; color:#fff; }
+    .sub { background:#e5e7eb; color:#111827; }
+    .err { color:#fecaca; }
 
-		.diag { padding:0 14px 12px; font-size:12px; color:#94a3b8; white-space:pre-wrap; }
-	</style>
+    .zoomRow { padding: 0 14px 10px; color:#cbd5e1; }
+    .zoomTop { display:flex; align-items:center; justify-content:space-between; font-size:14px; padding: 8px 0; }
+    #zoom { width:100%; }
+
+    .diag { padding:0 14px 12px; font-size:12px; color:#94a3b8; white-space:pre-wrap; }
+    canvas { display:none; }
+  </style>
 </head>
 <body>
-	<div class="head">外部ライブスキャナ</div>
-	<div id="reader"></div>
-	<div class="p" id="status">起動中…</div>
-
-	<div class="zoomRow" id="zoomWrap" style="display:none;">
-		<div class="zoomTop">
-			<div>ズーム</div>
-			<div><span id="zoomVal">1.0</span>x</div>
-		</div>
-		<input id="zoom" type="range" min="1" max="1" step="0.1" value="1" />
-	</div>
-
-	<div class="diag" id="diag"></div>
-
-	<div class="btns">
-		<button class="pri" id="retry" type="button">再試行</button>
-		<button class="sub" id="cancel" type="button">キャンセル</button>
-	</div>
-
-	<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
-	<script>
-		const qs = new URLSearchParams(location.search);
-		const target = qs.get("target") || "";
-		const tab = qs.get("tab") || "";
-		const returnOrigin = qs.get("returnOrigin") || "*";
-		const returnUrl = qs.get("returnUrl") || "";
-
-		const statusEl = document.getElementById("status");
-		const diagEl = document.getElementById("diag");
-		const setStatus = (t, err = false) => {
-			statusEl.textContent = t;
-			statusEl.className = "p" + (err ? " err" : "");
-		};
-		const setDiag = (t) => { diagEl.textContent = t || ""; };
-
-		const formats = [
-			Html5QrcodeSupportedFormats.EAN_13,
-			Html5QrcodeSupportedFormats.EAN_8,
-			Html5QrcodeSupportedFormats.UPC_A,
-			Html5QrcodeSupportedFormats.UPC_E,
-			Html5QrcodeSupportedFormats.CODE_128,
-			Html5QrcodeSupportedFormats.CODE_39,
-			Html5QrcodeSupportedFormats.ITF,
-		];
-
-		let qr = null;
-		let busy = false;
-		let sending = false;
-		let currentCameraId = null;
-		let restartTimer = null;
-		let rotatedScanTimer = null;
-		let rotatedScanBusy = false;
-		let detector = null;
-
-		const zoomWrap = document.getElementById("zoomWrap");
-		const zoomInput = document.getElementById("zoom");
-		const zoomVal = document.getElementById("zoomVal");
-
-		let zoomSupported = false;
-		let zoomApplyTimer = null;
-
-		function isPortrait() {
-			return window.innerHeight >= window.innerWidth;
-		}
-
-		function getConfig() {
-			return {
-				fps: 12,
-				qrbox: { width: 260, height: 260 },
-				formatsToSupport: formats,
-				disableFlip: false,
-				rememberLastUsedCamera: true,
-				aspectRatio: isPortrait() ? 1.333333 : 1.777778,
-				experimentalFeatures: {
-					useBarCodeDetectorIfSupported: true
-				}
-			};
-		}
-
-		function sendResult(code) {
-			if (sending) return;
-			sending = true;
-
-			const payload = { type: "barcode", code, target, tab };
-
-			if (window.opener) {
-				try {
-					window.opener.postMessage(payload, returnOrigin);
-					window.close();
-					return;
-				} catch (_) {}
-			}
-
-			if (returnUrl) {
-				try {
-					const u = new URL(returnUrl);
-					u.searchParams.set("tab", tab);
-					u.searchParams.set("target", target);
-					u.searchParams.set("code", code);
-					location.href = u.toString();
-					return;
-				} catch (_) {}
-			}
-
-			alert("SCAN: " + code);
-		}
-
-		async function stop() {
-			if (rotatedScanTimer) {
-				clearInterval(rotatedScanTimer);
-				rotatedScanTimer = null;
-			}
-
-			if (!qr) return;
-			try {
-				if (qr.isScanning) await qr.stop();
-			} catch (_) {}
-			try {
-				await qr.clear();
-			} catch (_) {}
-
-			zoomWrap.style.display = "none";
-			zoomSupported = false;
-		}
-
-		async function unlockLabels() {
-			let stream = null;
-			try {
-				stream = await navigator.mediaDevices.getUserMedia({
-					video: { facingMode: { ideal: "environment" } },
-					audio: false
-				});
-			} finally {
-				if (stream) {
-					stream.getTracks().forEach(t => t.stop());
-				}
-			}
-		}
-
-		function chooseBestCamera(devices) {
-			if (!devices || !devices.length) return null;
-
-			const scored = devices.map((d, i) => {
-				const label = String(d.label || "").toLowerCase();
-				let score = 0;
-
-				if (/back|rear|environment/.test(label)) score += 100;
-				if (/wide|ultra wide/.test(label)) score -= 10;
-				if (/front|user|face|facetime/.test(label)) score -= 100;
-
-				score += i * 0.1;
-				return { ...d, score };
-			}).sort((a, b) => b.score - a.score);
-
-			return scored[0] || devices[devices.length - 1];
-		}
-
-		async function resolveCameraId() {
-			await unlockLabels();
-			const devices = await Html5Qrcode.getCameras();
-			if (!devices || !devices.length) {
-				throw new Error("利用可能なカメラが見つかりません");
-			}
-			const best = chooseBestCamera(devices);
-			setDiag(
-				[
-					`cams=${devices.length}`,
-					`use=${best ? best.id : "-"}`,
-					`label=${best ? (best.label || "(no label)") : "-"}`,
-					...devices.map((d, i) => `#${i + 1} ${d.id} ${d.label || "(no label)"}`)
-				].join("\n")
-			);
-			return best.id;
-		}
-
-		function setupZoomUI() {
-			try {
-				const caps = qr.getRunningTrackCapabilities && qr.getRunningTrackCapabilities();
-				if (!caps || !caps.zoom) {
-					zoomWrap.style.display = "none";
-					zoomSupported = false;
-					return;
-				}
-				zoomSupported = true;
-
-				const z = caps.zoom;
-				const min = (typeof z.min === "number") ? z.min : 1;
-				const max = (typeof z.max === "number") ? z.max : 1;
-				const step = (typeof z.step === "number" && z.step > 0) ? z.step : 0.1;
-
-				zoomInput.min = String(min);
-				zoomInput.max = String(max);
-				zoomInput.step = String(step);
-
-				let current = min;
-				try {
-					const st = qr.getRunningTrackSettings && qr.getRunningTrackSettings();
-					if (st && typeof st.zoom === "number") current = st.zoom;
-				} catch (_) {}
-
-				current = Math.max(min, Math.min(max, current));
-				zoomInput.value = String(current);
-				zoomVal.textContent = Number(current).toFixed(1);
-				zoomWrap.style.display = "block";
-			} catch (_) {
-				zoomWrap.style.display = "none";
-				zoomSupported = false;
-			}
-		}
-
-		async function applyZoom(value) {
-			if (!qr || !zoomSupported) return;
-			const v = Number(value);
-			if (!Number.isFinite(v)) return;
-
-			zoomVal.textContent = v.toFixed(1);
-
-			try {
-				await qr.applyVideoConstraints({
-					advanced: [{ zoom: v }]
-				});
-			} catch (_) {}
-		}
-
-		zoomInput.addEventListener("input", () => {
-			if (zoomApplyTimer) clearTimeout(zoomApplyTimer);
-			const v = zoomInput.value;
-			zoomApplyTimer = setTimeout(() => applyZoom(v), 60);
-		});
-
-		function getVideoEl() {
-			const root = document.getElementById("reader");
-			if (!root) return null;
-			return root.querySelector("video");
-		}
-
-		function ensureDetector() {
-			if (!("BarcodeDetector" in window)) return null;
-			if (detector) return detector;
-
-			try {
-				detector = new BarcodeDetector({
-					formats: [
-						"ean_13",
-						"ean_8",
-						"upc_a",
-						"upc_e",
-						"code_128",
-						"code_39",
-						"itf"
-					]
-				});
-				return detector;
-			} catch (_) {
-				return null;
-			}
-		}
-
-		function drawVideoFrameToCanvas(video, rotateDeg = 0) {
-			const vw = video.videoWidth || 0;
-			const vh = video.videoHeight || 0;
-			if (!vw || !vh) return null;
-
-			const canvas = document.createElement("canvas");
-			const ctx = canvas.getContext("2d", { willReadFrequently: true });
-			if (!ctx) return null;
-
-			if (rotateDeg === 90 || rotateDeg === 270) {
-				canvas.width = vh;
-				canvas.height = vw;
-			} else {
-				canvas.width = vw;
-				canvas.height = vh;
-			}
-
-			if (rotateDeg === 0) {
-				ctx.drawImage(video, 0, 0, vw, vh);
-			} else if (rotateDeg === 90) {
-				ctx.translate(canvas.width, 0);
-				ctx.rotate(Math.PI / 2);
-				ctx.drawImage(video, 0, 0, vw, vh);
-			} else if (rotateDeg === 270) {
-				ctx.translate(0, canvas.height);
-				ctx.rotate(-Math.PI / 2);
-				ctx.drawImage(video, 0, 0, vw, vh);
-			} else if (rotateDeg === 180) {
-				ctx.translate(canvas.width, canvas.height);
-				ctx.rotate(Math.PI);
-				ctx.drawImage(video, 0, 0, vw, vh);
-			}
-
-			return canvas;
-		}
-
-		async function detectBarcodeFromCanvas(canvas) {
-			const d = ensureDetector();
-			if (!d || !canvas) return "";
-
-			try {
-				const results = await d.detect(canvas);
-				if (!results || !results.length) return "";
-				const raw = results.find(r => r && r.rawValue);
-				return raw ? String(raw.rawValue).trim() : "";
-			} catch (_) {
-				return "";
-			}
-		}
-
-		async function tryRotatedFallbackScan() {
-			if (rotatedScanBusy || sending) return;
-
-			const d = ensureDetector();
-			if (!d) return;
-
-			const video = getVideoEl();
-			if (!video) return;
-			if (video.readyState < 2) return;
-
-			rotatedScanBusy = true;
-			try {
-				let canvas = drawVideoFrameToCanvas(video, 90);
-				let code = await detectBarcodeFromCanvas(canvas);
-				if (code) {
-					setStatus(`スキャン成功: ${code}`);
-					try { await stop(); } catch (_) {}
-					sendResult(code);
-					return;
-				}
-
-				canvas = drawVideoFrameToCanvas(video, 270);
-				code = await detectBarcodeFromCanvas(canvas);
-				if (code) {
-					setStatus(`スキャン成功: ${code}`);
-					try { await stop(); } catch (_) {}
-					sendResult(code);
-					return;
-				}
-			} finally {
-				rotatedScanBusy = false;
-			}
-		}
-
-		function startRotatedFallbackLoop() {
-			if (rotatedScanTimer) clearInterval(rotatedScanTimer);
-			rotatedScanTimer = setInterval(() => {
-				tryRotatedFallbackScan();
-			}, 500);
-		}
-
-		async function start() {
-			if (busy) return;
-			busy = true;
-			sending = false;
-
-			try {
-				if (!window.isSecureContext) {
-					setStatus("HTTPSで開いてください（カメラはHTTPS必須）", true);
-					return;
-				}
-
-				if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-					setStatus("このブラウザはカメラAPIに対応していません", true);
-					return;
-				}
-
-				if (!qr) qr = new Html5Qrcode("reader", { verbose: false });
-				await stop();
-
-				setStatus("カメラ起動中…（許可ダイアログが出たら許可）");
-
-				currentCameraId = await resolveCameraId();
-
-				await qr.start(
-					currentCameraId,
-					getConfig(),
-					async (decodedText) => {
-						const code = String(decodedText || "").trim();
-						if (!code || sending) return;
-						setStatus(`スキャン成功: ${code}`);
-						try { await stop(); } catch (_) {}
-						sendResult(code);
-					},
-					() => {}
-				);
-
-				await showDetectorSupport();
-				startRotatedFallbackLoop();
-				setupZoomUI();
-				setStatus("バーコードを枠内に合わせてください");
-			} catch (e) {
-				setStatus(
-					`起動失敗: ${(e && e.name) || "Error"} / ${(e && e.message) || e}\n` +
-					`・ブラウザのカメラ許可をON\n` +
-					`・LINE等のアプリ内ブラウザではなくChrome/Safariで開く\n` +
-					`・再試行で改善することがあります`,
-					true
-				);
-			} finally {
-				busy = false;
-			}
-		}
-
-		async function showDetectorSupport() {
-			try {
-				if (!("BarcodeDetector" in window)) {
-					setDiag("BarcodeDetector: unsupported");
-					return false;
-				}
-				
-				let supported = [];
-				if (typeof BarcodeDetector.getSupportedFormats === "function") {
-					supported = await BarcodeDetector.getSupportedFormats();
-				}
-				
-				setDiag(
-					"BarcodeDetector: supported\n" +
-					"formats=" + (supported && supported.length ? supported.join(", ") : "(unknown)")
-				);
-				return true;
-			} catch (e) {
-				setDiag("BarcodeDetector: error / " + ((e && e.message) || e));
-				return false;
-			}
-		}
-
-		function scheduleRestart() {
-			if (restartTimer) clearTimeout(restartTimer);
-			restartTimer = setTimeout(() => {
-				start();
-			}, 250);
-		}
-
-		window.addEventListener("orientationchange", scheduleRestart);
-		window.addEventListener("resize", scheduleRestart);
-
-		document.getElementById("retry").addEventListener("click", start);
-
-		document.getElementById("cancel").addEventListener("click", async () => {
-			await stop();
-			window.close();
-			if (returnUrl) location.href = returnUrl;
-		});
-
-		start();
-	</script>
+  <div class="head">外部ライブスキャナ</div>
+
+  <div id="readerWrap">
+    <video id="video" muted playsinline autoplay></video>
+    <div id="guide"></div>
+  </div>
+
+  <div class="p" id="status">起動中…</div>
+
+  <div class="zoomRow" id="zoomWrap" style="display:none;">
+    <div class="zoomTop">
+      <div>ズーム</div>
+      <div><span id="zoomVal">1.0</span>x</div>
+    </div>
+    <input id="zoom" type="range" min="1" max="1" step="0.1" value="1" />
+  </div>
+
+  <div class="diag" id="diag"></div>
+
+  <div class="btns">
+    <button class="pri" id="retry" type="button">再試行</button>
+    <button class="sub" id="cancel" type="button">キャンセル</button>
+  </div>
+
+  <!-- ZXing UMD -->
+  <script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
+  <script>
+    const qs = new URLSearchParams(location.search);
+    const target = qs.get("target") || "";
+    const tab = qs.get("tab") || "";
+    const returnOrigin = qs.get("returnOrigin") || "*";
+    const returnUrl = qs.get("returnUrl") || "";
+
+    const statusEl = document.getElementById("status");
+    const diagEl = document.getElementById("diag");
+    const videoEl = document.getElementById("video");
+
+    const zoomWrap = document.getElementById("zoomWrap");
+    const zoomInput = document.getElementById("zoom");
+    const zoomVal = document.getElementById("zoomVal");
+
+    const setStatus = (t, err = false) => {
+      statusEl.textContent = t;
+      statusEl.className = "p" + (err ? " err" : "");
+    };
+    const setDiag = (t) => { diagEl.textContent = t || ""; };
+
+    let codeReader = null;
+    let controls = null;
+    let stream = null;
+
+    let busy = false;
+    let sending = false;
+    let currentCameraId = null;
+    let restartTimer = null;
+
+    let zoomSupported = false;
+    let zoomApplyTimer = null;
+
+    let rotatedScanTimer = null;
+    let rotatedScanBusy = false;
+
+    const hints = new Map();
+    hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [
+      ZXing.BarcodeFormat.EAN_13,
+      ZXing.BarcodeFormat.EAN_8,
+      ZXing.BarcodeFormat.UPC_A,
+      ZXing.BarcodeFormat.UPC_E,
+      ZXing.BarcodeFormat.CODE_128,
+      ZXing.BarcodeFormat.CODE_39,
+      ZXing.BarcodeFormat.ITF
+    ]);
+    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+
+    const fallbackReader = new ZXing.MultiFormatReader();
+    fallbackReader.setHints(hints);
+
+    function isPortrait() {
+      return window.innerHeight >= window.innerWidth;
+    }
+
+    function sendResult(code) {
+      if (sending) return;
+      sending = true;
+
+      const payload = { type: "barcode", code, target, tab };
+
+      if (window.opener) {
+        try {
+          window.opener.postMessage(payload, returnOrigin);
+          window.close();
+          return;
+        } catch (_) {}
+      }
+
+      if (returnUrl) {
+        try {
+          const u = new URL(returnUrl);
+          u.searchParams.set("tab", tab);
+          u.searchParams.set("target", target);
+          u.searchParams.set("code", code);
+          location.href = u.toString();
+          return;
+        } catch (_) {}
+      }
+
+      alert("SCAN: " + code);
+    }
+
+    async function stop() {
+      if (rotatedScanTimer) {
+        clearInterval(rotatedScanTimer);
+        rotatedScanTimer = null;
+      }
+
+      try {
+        if (controls && typeof controls.stop === "function") {
+          controls.stop();
+        }
+      } catch (_) {}
+
+      controls = null;
+
+      try {
+        if (codeReader && typeof codeReader.reset === "function") {
+          codeReader.reset();
+        }
+      } catch (_) {}
+
+      try {
+        if (stream) {
+          stream.getTracks().forEach(t => t.stop());
+        }
+      } catch (_) {}
+
+      stream = null;
+      videoEl.srcObject = null;
+
+      zoomWrap.style.display = "none";
+      zoomSupported = false;
+    }
+
+    async function unlockLabels() {
+      let tmp = null;
+      try {
+        tmp = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" } },
+          audio: false
+        });
+      } finally {
+        if (tmp) tmp.getTracks().forEach(t => t.stop());
+      }
+    }
+
+    function chooseBestCamera(devices) {
+      if (!devices || !devices.length) return null;
+
+      const scored = devices.map((d, i) => {
+        const label = String(d.label || "").toLowerCase();
+        let score = 0;
+
+        if (/back|rear|environment/.test(label)) score += 100;
+        if (/front|user|face|facetime/.test(label)) score -= 100;
+        if (/wide|ultra wide/.test(label)) score -= 10;
+
+        score += i * 0.1;
+        return { ...d, score };
+      }).sort((a, b) => b.score - a.score);
+
+      return scored[0] || devices[devices.length - 1];
+    }
+
+    async function resolveCameraId() {
+      await unlockLabels();
+      const devices = await ZXing.BrowserMultiFormatReader.listVideoInputDevices();
+      if (!devices || !devices.length) {
+        throw new Error("利用可能なカメラが見つかりません");
+      }
+
+      const best = chooseBestCamera(devices);
+      setDiag(
+        [
+          `cams=${devices.length}`,
+          `use=${best ? best.deviceId : "-"}`,
+          `label=${best ? (best.label || "(no label)") : "-"}`,
+          ...devices.map((d, i) => `#${i + 1} ${d.deviceId} ${d.label || "(no label)"}`)
+        ].join("\n")
+      );
+
+      return best.deviceId;
+    }
+
+    function getRunningTrack() {
+      const s = videoEl.srcObject;
+      if (!s || !s.getVideoTracks || !s.getVideoTracks().length) return null;
+      return s.getVideoTracks()[0];
+    }
+
+    function setupZoomUI() {
+      try {
+        const track = getRunningTrack();
+        if (!track || !track.getCapabilities) {
+          zoomWrap.style.display = "none";
+          zoomSupported = false;
+          return;
+        }
+
+        const caps = track.getCapabilities();
+        if (!caps || !caps.zoom) {
+          zoomWrap.style.display = "none";
+          zoomSupported = false;
+          return;
+        }
+
+        zoomSupported = true;
+        const z = caps.zoom;
+        const min = (typeof z.min === "number") ? z.min : 1;
+        const max = (typeof z.max === "number") ? z.max : 1;
+        const step = (typeof z.step === "number" && z.step > 0) ? z.step : 0.1;
+
+        zoomInput.min = String(min);
+        zoomInput.max = String(max);
+        zoomInput.step = String(step);
+
+        let current = min;
+        try {
+          const st = track.getSettings ? track.getSettings() : {};
+          if (st && typeof st.zoom === "number") current = st.zoom;
+        } catch (_) {}
+
+        current = Math.max(min, Math.min(max, current));
+        zoomInput.value = String(current);
+        zoomVal.textContent = Number(current).toFixed(1);
+        zoomWrap.style.display = "block";
+      } catch (_) {
+        zoomWrap.style.display = "none";
+        zoomSupported = false;
+      }
+    }
+
+    async function applyZoom(value) {
+      const track = getRunningTrack();
+      if (!track || !zoomSupported || !track.applyConstraints) return;
+
+      const v = Number(value);
+      if (!Number.isFinite(v)) return;
+
+      zoomVal.textContent = v.toFixed(1);
+
+      try {
+        await track.applyConstraints({
+          advanced: [{ zoom: v }]
+        });
+      } catch (_) {}
+    }
+
+    zoomInput.addEventListener("input", () => {
+      if (zoomApplyTimer) clearTimeout(zoomApplyTimer);
+      const v = zoomInput.value;
+      zoomApplyTimer = setTimeout(() => applyZoom(v), 60);
+    });
+
+    function getGuideCropRect(video, rotateDeg = 0) {
+      const vw = video.videoWidth || 0;
+      const vh = video.videoHeight || 0;
+      if (!vw || !vh) return null;
+
+      const size = Math.floor(Math.min(vw, vh) * 0.55);
+      const sx = Math.max(0, Math.floor((vw - size) / 2));
+      const sy = Math.max(0, Math.floor((vh - size) / 2));
+      const sw = Math.min(size, vw);
+      const sh = Math.min(size, vh);
+
+      return { sx, sy, sw, sh, rotateDeg };
+    }
+
+    function drawCropToCanvas(video, rotateDeg = 0) {
+      const rect = getGuideCropRect(video, rotateDeg);
+      if (!rect) return null;
+
+      const { sx, sy, sw, sh } = rect;
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return null;
+
+      if (rotateDeg === 90 || rotateDeg === 270) {
+        canvas.width = sh;
+        canvas.height = sw;
+      } else {
+        canvas.width = sw;
+        canvas.height = sh;
+      }
+
+      if (rotateDeg === 0) {
+        ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+      } else if (rotateDeg === 90) {
+        ctx.translate(canvas.width, 0);
+        ctx.rotate(Math.PI / 2);
+        ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+      } else if (rotateDeg === 270) {
+        ctx.translate(0, canvas.height);
+        ctx.rotate(-Math.PI / 2);
+        ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+      }
+
+      return canvas;
+    }
+
+    function decodeCanvasWithZXing(canvas) {
+      if (!canvas) return "";
+
+      try {
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        const w = canvas.width;
+        const h = canvas.height;
+        const imageData = ctx.getImageData(0, 0, w, h);
+        const luminance = new ZXing.RGBLuminanceSource(imageData.data, w, h);
+        const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
+        const result = fallbackReader.decode(bitmap);
+        return result && result.getText ? String(result.getText()).trim() : "";
+      } catch (_) {
+        return "";
+      } finally {
+        try { fallbackReader.reset(); } catch (_) {}
+      }
+    }
+
+    async function tryRotatedFallbackScan() {
+      if (rotatedScanBusy || sending) return;
+      if (!videoEl || videoEl.readyState < 2) return;
+
+      rotatedScanBusy = true;
+      try {
+        let canvas = drawCropToCanvas(videoEl, 90);
+        let code = decodeCanvasWithZXing(canvas);
+        if (code) {
+          setStatus(`スキャン成功: ${code}`);
+          try { await stop(); } catch (_) {}
+          sendResult(code);
+          return;
+        }
+
+        canvas = drawCropToCanvas(videoEl, 270);
+        code = decodeCanvasWithZXing(canvas);
+        if (code) {
+          setStatus(`スキャン成功: ${code}`);
+          try { await stop(); } catch (_) {}
+          sendResult(code);
+          return;
+        }
+      } finally {
+        rotatedScanBusy = false;
+      }
+    }
+
+    function startRotatedFallbackLoop() {
+      if (rotatedScanTimer) clearInterval(rotatedScanTimer);
+      rotatedScanTimer = setInterval(() => {
+        tryRotatedFallbackScan();
+      }, 350);
+    }
+
+    async function start() {
+      if (busy) return;
+      busy = true;
+      sending = false;
+
+      try {
+        if (!window.isSecureContext) {
+          setStatus("HTTPSで開いてください（カメラはHTTPS必須）", true);
+          return;
+        }
+
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          setStatus("このブラウザはカメラAPIに対応していません", true);
+          return;
+        }
+
+        await stop();
+        setStatus("カメラ起動中…（許可ダイアログが出たら許可）");
+
+        currentCameraId = await resolveCameraId();
+        codeReader = new ZXing.BrowserMultiFormatReader(hints);
+
+        controls = await codeReader.decodeFromVideoDevice(
+          currentCameraId,
+          videoEl,
+          async (result, err) => {
+            if (result) {
+              const text = String(result.getText ? result.getText() : result.text || "").trim();
+              if (!text || sending) return;
+              setStatus(`スキャン成功: ${text}`);
+              try { await stop(); } catch (_) {}
+              sendResult(text);
+              return;
+            }
+
+            // NotFound は常時出るので無視
+            if (err && !(err instanceof ZXing.NotFoundException)) {
+              // ここは黙って補助読取に任せる
+            }
+          }
+        );
+
+        stream = videoEl.srcObject instanceof MediaStream ? videoEl.srcObject : null;
+
+        startRotatedFallbackLoop();
+        setupZoomUI();
+        setStatus("バーコードを枠内に合わせてください");
+      } catch (e) {
+        setStatus(
+          `起動失敗: ${(e && e.name) || "Error"} / ${(e && e.message) || e}\n` +
+          `・ブラウザのカメラ許可をON\n` +
+          `・LINE等のアプリ内ブラウザではなくChrome/Safariで開く\n` +
+          `・再試行で改善することがあります`,
+          true
+        );
+      } finally {
+        busy = false;
+      }
+    }
+
+    function scheduleRestart() {
+      if (restartTimer) clearTimeout(restartTimer);
+      restartTimer = setTimeout(() => {
+        start();
+      }, 250);
+    }
+
+    window.addEventListener("orientationchange", scheduleRestart);
+    window.addEventListener("resize", scheduleRestart);
+
+    document.getElementById("retry").addEventListener("click", start);
+
+    document.getElementById("cancel").addEventListener("click", async () => {
+      await stop();
+      window.close();
+      if (returnUrl) location.href = returnUrl;
+    });
+
+    start();
+  </script>
 </body>
 </html>
