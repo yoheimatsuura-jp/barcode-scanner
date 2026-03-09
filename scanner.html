@@ -408,6 +408,7 @@
 					() => {}
 				);
 
+				await showDetectorSupport();
 				startRotatedFallbackLoop();
 				setupZoomUI();
 				setStatus("バーコードを枠内に合わせてください");
@@ -421,6 +422,29 @@
 				);
 			} finally {
 				busy = false;
+			}
+		}
+
+		async function showDetectorSupport() {
+			try {
+				if (!("BarcodeDetector" in window)) {
+					setDiag("BarcodeDetector: unsupported");
+					return false;
+				}
+				
+				let supported = [];
+				if (typeof BarcodeDetector.getSupportedFormats === "function") {
+					supported = await BarcodeDetector.getSupportedFormats();
+				}
+				
+				setDiag(
+					"BarcodeDetector: supported\n" +
+					"formats=" + (supported && supported.length ? supported.join(", ") : "(unknown)")
+				);
+				return true;
+			} catch (e) {
+				setDiag("BarcodeDetector: error / " + ((e && e.message) || e));
+				return false;
 			}
 		}
 
