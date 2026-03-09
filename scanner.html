@@ -422,16 +422,16 @@
 				setStatus("カメラ起動中…（許可ダイアログが出たら許可）");
 
 				await qr.start(
-					{
-						facingMode: { ideal: "environment" },
-						width: { ideal: 1920 },
-						height: { ideal: 1080 }
-					},
+					{ facingMode: "environment" },
 					{
 						fps: 14,
 						qrbox: getScanBox,
 						formatsToSupport: formats,
 						disableFlip: false,
+						videoConstraints: {
+							width: { ideal: 1920 },
+							height: { ideal: 1080 }
+						},
 					},
 					(decodedText) => {
 						lockAndSendResult(decodedText);
@@ -440,6 +440,12 @@
 				);
 
 				setupZoomUI();
+				try {
+					await qr.applyVideoConstraints({
+						width: { ideal: 1920 },
+						height: { ideal: 1080 }
+					});
+				} catch (_) {}
 				await applyFocusAndExposureHints();
 				scheduleScanLoop();
 
