@@ -230,16 +230,29 @@
         throw new Error("利用可能なカメラが見つかりません");
       }
 
-      const best = chooseBestCamera(devices);
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices
+        .filter((d) => d.kind === "videoinput")
+        .map((d) => ({
+          deviceId: d.deviceId,
+          label: d.label || ""
+        }));
+      
+      if (!videoDevices.length) {
+        throw new Error("利用可能なカメラが見つかりません");
+      }
+      
+      const best = chooseBestCamera(videoDevices);
+      
       setDiag(
         [
-          `cams=${devices.length}`,
+          `cams=${videoDevices.length}`,
           `use=${best ? best.deviceId : "-"}`,
           `label=${best ? (best.label || "(no label)") : "-"}`,
-          ...devices.map((d, i) => `#${i + 1} ${d.deviceId} ${d.label || "(no label)"}`)
+          ...videoDevices.map((d, i) => `#${i + 1} ${d.deviceId} ${d.label || "(no label)"}`)
         ].join("\n")
       );
-
+      
       return best.deviceId;
     }
 
@@ -433,7 +446,7 @@
         setStatus("カメラ起動中…（許可ダイアログが出たら許可）");
 
         currentCameraId = await resolveCameraId();
-        codeReader = new ZXing.BrowserMultiFormatReader(hints);
+        codeReader = new ZXing.BrowserMultiFormatReader();
 
         controls = await codeReader.decodeFromVideoDevice(
           currentCameraId,
