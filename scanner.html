@@ -21,7 +21,6 @@
       background: #000;
       display: block;
     }
-    /* 正方形ガイド */
     #guide {
       position: absolute;
       left: 50%;
@@ -75,7 +74,6 @@
     <button class="sub" id="cancel" type="button">キャンセル</button>
   </div>
 
-  <!-- ZXing UMD -->
   <script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
   <script>
     const qs = new URLSearchParams(location.search);
@@ -225,25 +223,21 @@
 
     async function resolveCameraId() {
       await unlockLabels();
-      const devices = await ZXing.BrowserMultiFormatReader.listVideoInputDevices();
-      if (!devices || !devices.length) {
-        throw new Error("利用可能なカメラが見つかりません");
-      }
 
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const videoDevices = devices
+      const allDevices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = allDevices
         .filter((d) => d.kind === "videoinput")
         .map((d) => ({
           deviceId: d.deviceId,
           label: d.label || ""
         }));
-      
+
       if (!videoDevices.length) {
         throw new Error("利用可能なカメラが見つかりません");
       }
-      
+
       const best = chooseBestCamera(videoDevices);
-      
+
       setDiag(
         [
           `cams=${videoDevices.length}`,
@@ -252,7 +246,7 @@
           ...videoDevices.map((d, i) => `#${i + 1} ${d.deviceId} ${d.label || "(no label)"}`)
         ].join("\n")
       );
-      
+
       return best.deviceId;
     }
 
@@ -326,7 +320,7 @@
       zoomApplyTimer = setTimeout(() => applyZoom(v), 60);
     });
 
-    function getGuideCropRect(video, rotateDeg = 0) {
+    function getGuideCropRect(video) {
       const vw = video.videoWidth || 0;
       const vh = video.videoHeight || 0;
       if (!vw || !vh) return null;
@@ -337,11 +331,11 @@
       const sw = Math.min(size, vw);
       const sh = Math.min(size, vh);
 
-      return { sx, sy, sw, sh, rotateDeg };
+      return { sx, sy, sw, sh };
     }
 
     function drawCropToCanvas(video, rotateDeg = 0) {
-      const rect = getGuideCropRect(video, rotateDeg);
+      const rect = getGuideCropRect(video);
       if (!rect) return null;
 
       const { sx, sy, sw, sh } = rect;
@@ -394,9 +388,9 @@
     async function tryRotatedFallbackScan() {
       if (rotatedScanBusy || sending) return;
       if (!videoEl || videoEl.readyState < 2) return;
-      
+
       setDiag("fallback: running");
-      
+
       rotatedScanBusy = true;
       try {
         let canvas = drawCropToCanvas(videoEl, 90);
@@ -408,7 +402,7 @@
           sendResult(code);
           return;
         }
-        
+
         canvas = drawCropToCanvas(videoEl, 270);
         code = decodeCanvasWithZXing(canvas);
         if (code) {
@@ -418,7 +412,7 @@
           sendResult(code);
           return;
         }
-        
+
         setDiag("fallback: no hit");
       } finally {
         rotatedScanBusy = false;
@@ -467,9 +461,7 @@
               return;
             }
 
-            // NotFound は常時出るので無視
             if (err && !(err instanceof ZXing.NotFoundException)) {
-              // ここは黙って補助読取に任せる
             }
           }
         );
