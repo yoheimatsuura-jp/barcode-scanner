@@ -88,23 +88,6 @@
 			return window.innerHeight >= window.innerWidth;
 		}
 
-		function buildQrbox(viewfinderWidth, viewfinderHeight) {
-			const w = Math.max(220, Math.floor(viewfinderWidth * 0.90));
-			const portrait = viewfinderHeight >= viewfinderWidth;
-
-			// 1Dバーコードを読みやすくするため横長にする
-			if (portrait) {
-				return {
-					width: Math.min(w, viewfinderWidth - 24),
-					height: Math.max(90, Math.floor(viewfinderHeight * 0.18))
-				};
-			}
-			return {
-				width: Math.min(Math.floor(viewfinderWidth * 0.82), viewfinderWidth - 24),
-				height: Math.max(100, Math.floor(viewfinderHeight * 0.22))
-			};
-		}
-
 		function getConfig() {
 			return {
 				fps: 12,
@@ -152,7 +135,7 @@
 				clearInterval(rotatedScanTimer);
 				rotatedScanTimer = null;
 			}
-			
+
 			if (!qr) return;
 			try {
 				if (qr.isScanning) await qr.stop();
@@ -160,13 +143,12 @@
 			try {
 				await qr.clear();
 			} catch (_) {}
-			
+
 			zoomWrap.style.display = "none";
 			zoomSupported = false;
 		}
 
 		async function unlockLabels() {
-			// カメラ名を取得しやすくするため、最初に一度だけ権限を取る
 			let stream = null;
 			try {
 				stream = await navigator.mediaDevices.getUserMedia({
@@ -191,9 +173,7 @@
 				if (/wide|ultra wide/.test(label)) score -= 10;
 				if (/front|user|face|facetime/.test(label)) score -= 100;
 
-				// 末尾を少し優先する端末があるので補正
 				score += i * 0.1;
-
 				return { ...d, score };
 			}).sort((a, b) => b.score - a.score);
 
@@ -278,11 +258,11 @@
 			if (!root) return null;
 			return root.querySelector("video");
 		}
-		
+
 		function ensureDetector() {
 			if (!("BarcodeDetector" in window)) return null;
 			if (detector) return detector;
-			
+
 			try {
 				detector = new BarcodeDetector({
 					formats: [
@@ -295,22 +275,21 @@
 						"itf"
 					]
 				});
-				
 				return detector;
 			} catch (_) {
 				return null;
 			}
 		}
-		
+
 		function drawVideoFrameToCanvas(video, rotateDeg = 0) {
 			const vw = video.videoWidth || 0;
 			const vh = video.videoHeight || 0;
 			if (!vw || !vh) return null;
-			
+
 			const canvas = document.createElement("canvas");
 			const ctx = canvas.getContext("2d", { willReadFrequently: true });
 			if (!ctx) return null;
-			
+
 			if (rotateDeg === 90 || rotateDeg === 270) {
 				canvas.width = vh;
 				canvas.height = vw;
@@ -318,7 +297,7 @@
 				canvas.width = vw;
 				canvas.height = vh;
 			}
-			
+
 			if (rotateDeg === 0) {
 				ctx.drawImage(video, 0, 0, vw, vh);
 			} else if (rotateDeg === 90) {
@@ -334,14 +313,14 @@
 				ctx.rotate(Math.PI);
 				ctx.drawImage(video, 0, 0, vw, vh);
 			}
-			
+
 			return canvas;
 		}
-		
+
 		async function detectBarcodeFromCanvas(canvas) {
 			const d = ensureDetector();
 			if (!d || !canvas) return "";
-			
+
 			try {
 				const results = await d.detect(canvas);
 				if (!results || !results.length) return "";
@@ -351,62 +330,17 @@
 				return "";
 			}
 		}
-		
+
 		async function tryRotatedFallbackScan() {
 			if (rotatedScanBusy || sending) return;
-			
+
 			const d = ensureDetector();
 			if (!d) return;
-			
+
 			const video = getVideoEl();
 			if (!video) return;
 			if (video.readyState < 2) return;
 
-			rotatedScanBusy = true;
-			try {
-				// まず通常向き
-				let canvas = drawVideoFrameToCanvas(video, 0);
-				let code = await detectBarcodeFromCanvas(canvas);
-				if (code) {
-					setStatus(`スキャン成功: ${code}`);
-					try { await stop(); } catch (_) {}
-					sendResult(code);
-					return;
-				}
-				
-				// 縦向き対策：90度
-				canvas = drawVideoFrameToCanvas(video, 90);
-				code = await detectBarcodeFromCanvas(canvas);
-				if (code) {
-					setStatus(`スキャン成功: ${code}`);
-					try { await stop(); } catch (_) {}
-					sendResult(code);
-					return;
-				}
-				
-				// 縦向き対策：270度
-				canvas = drawVideoFrameToCanvas(video, 270);
-				code = await detectBarcodeFromCanvas(canvas);
-				if (code) {
-					setStatus(`スキャン成功: ${code}`);
-					try { await stop(); } catch (_) {}
-					sendResult(code);
-					return;
-				}
-			} finally {
-				rotatedScanBusy = false;
-			}
-		}
-		
-		function startRotatedFallbackLoop() {
-			if (rotatedScanTimer) clearInterval(rotatedScanTimer);
-			
-			// 0.5秒ごとに補助判定
-			rotatedScanTimer = setInterval(() => {
-				tryRotatedFallbackScan();
-			}, 500);
-		}
-			
 			rotatedScanBusy = true;
 			try {
 				let canvas = drawVideoFrameToCanvas(video, 90);
@@ -417,7 +351,7 @@
 					sendResult(code);
 					return;
 				}
-				
+
 				canvas = drawVideoFrameToCanvas(video, 270);
 				code = await detectBarcodeFromCanvas(canvas);
 				if (code) {
@@ -429,6 +363,14 @@
 			} finally {
 				rotatedScanBusy = false;
 			}
+		}
+
+		function startRotatedFallbackLoop() {
+			if (rotatedScanTimer) clearInterval(rotatedScanTimer);
+			rotatedScanTimer = setInterval(() => {
+				tryRotatedFallbackScan();
+			}, 500);
+		}
 
 		async function start() {
 			if (busy) return;
@@ -468,7 +410,7 @@
 
 				startRotatedFallbackLoop();
 				setupZoomUI();
-				setStatus("バーコードを横長の枠内に合わせてください");
+				setStatus("バーコードを枠内に合わせてください");
 			} catch (e) {
 				setStatus(
 					`起動失敗: ${(e && e.name) || "Error"} / ${(e && e.message) || e}\n` +
