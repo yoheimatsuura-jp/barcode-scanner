@@ -38,7 +38,32 @@
 	<div class="btns">
 		<button class="pri" id="retry" type="button">再試行</button>
 		<button class="sub" id="cancel" type="button">キャンセル</button>
-@@ -52,6 +67,14 @@
+	</div>
+
+	<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+	<script>
+		const qs = new URLSearchParams(location.search);
+		const target = qs.get("target") || "";
+		const tab = qs.get("tab") || "";
+		const returnOrigin = qs.get("returnOrigin") || "*";
+		const returnUrl = qs.get("returnUrl") || "";
+
+		const statusEl = document.getElementById("status");
+		const setStatus = (t, err = false) => {
+			statusEl.textContent = t;
+			statusEl.className = "p" + (err ? " err" : "");
+		};
+
+		const formats = [
+			Html5QrcodeSupportedFormats.EAN_13,
+			Html5QrcodeSupportedFormats.EAN_8,
+			Html5QrcodeSupportedFormats.UPC_A,
+			Html5QrcodeSupportedFormats.UPC_E,
+			Html5QrcodeSupportedFormats.CODE_128,
+			Html5QrcodeSupportedFormats.CODE_39,
+			Html5QrcodeSupportedFormats.ITF,
+		];
+
 		let qr = null;
 		let busy = false;
 
@@ -53,7 +78,31 @@
 		function sendResult(code) {
 			const payload = { type: "barcode", code, target, tab };
 
-@@ -83,8 +106,77 @@
+			if (window.opener) {
+				try {
+					window.opener.postMessage(payload, returnOrigin);
+					window.close();
+					return;
+				} catch (_) {}
+			}
+
+			if (returnUrl) {
+				const u = new URL(returnUrl);
+				u.searchParams.set("tab", tab);
+				u.searchParams.set("target", target);
+				u.searchParams.set("code", code);
+				location.href = u.toString();
+				return;
+			}
+
+			alert("SCAN: " + code);
+		}
+
+		async function stop() {
+			if (!qr) return;
+			try {
+				if (qr.isScanning) await qr.stop();
+			} catch (_) {}
 			try {
 				await qr.clear();
 			} catch (_) {}
@@ -131,7 +180,32 @@
 		async function start() {
 			if (busy) return;
 			busy = true;
-@@ -117,6 +209,9 @@
+
+			try {
+				if (!window.isSecureContext) {
+					setStatus("HTTPSで開いてください（カメラはHTTPS必須）", true);
+					return;
+				}
+
+				if (!qr) qr = new Html5Qrcode("reader", { verbose: false });
+				await stop();
+
+				setStatus("カメラ起動中…（許可ダイアログが出たら許可）");
+
+				await qr.start(
+					{ facingMode: "environment" },
+					{
+						fps: 10,
+						qrbox: { width: 260, height: 260 },
+						formatsToSupport: formats,
+						disableFlip: false,
+					},
+					(decodedText) => {
+						const code = String(decodedText || "").trim();
+						if (!code) return;
+						setStatus(`スキャン成功: ${code}`);
+						sendResult(code);
+					},
 					() => {}
 				);
 
@@ -141,9 +215,23 @@
 				setStatus("バーコードを枠内に合わせてください");
 			} catch (e) {
 				setStatus(
-@@ -139,4 +234,4 @@
+					`起動失敗: ${(e && e.name) || "Error"} / ${(e && e.message) || e}\n` +
+					`・ブラウザのカメラ許可ON\n・LINE等のアプリ内ブラウザではなくChrome/Safariで開く`,
+					true
+				);
+			} finally {
+				busy = false;
+			}
+		}
+
+		document.getElementById("retry").addEventListener("click", start);
+		document.getElementById("cancel").addEventListener("click", async () => {
+			await stop();
+			window.close();
+			if (returnUrl) location.href = returnUrl;
+		});
+
 		start();
 	</script>
 </body>
-</html>
 </html>
