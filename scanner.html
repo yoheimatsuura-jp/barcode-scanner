@@ -393,54 +393,6 @@
       return canvas;
     }
 
-    function decodeCanvas(canvas) {
-      if (!canvas) return "";
-
-      try {
-        const ctx = canvas.getContext("2d", { willReadFrequently: true });
-        const w = canvas.width;
-        const h = canvas.height;
-        const imageData = ctx.getImageData(0, 0, w, h);
-        const luminance = new ZXing.RGBLuminanceSource(imageData.data, w, h);
-        const bitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
-        const result = reader.decode(bitmap);
-        return result && result.getText ? String(result.getText()).trim() : "";
-      } catch (_) {
-        return "";
-      } finally {
-        try { reader.reset(); } catch (_) {}
-      }
-    }
-
-    async function scanFrame() {
-      if (scanBusy || sending) return;
-      if (!videoEl || videoEl.readyState < 2) return;
-
-      scanBusy = true;
-      try {
-        const rotations = [0, 90, 270, 180];
-        for (const deg of rotations) {
-          const canvas = drawCropToCanvas(videoEl, deg);
-          const code = decodeCanvas(canvas);
-          if (code) {
-            setStatus(`スキャン成功: ${code}`);
-            try { await stop(); } catch (_) {}
-            sendResult(code);
-            return;
-          }
-        }
-      } finally {
-        scanBusy = false;
-      }
-    }
-
-    function startScanLoop() {
-      if (scanTimer) clearInterval(scanTimer);
-      scanTimer = setInterval(() => {
-        scanFrame();
-      }, 220);
-    }
-
     async function start() {
       if (busy) return;
       busy = true;
@@ -462,20 +414,34 @@
 
         const cameraId = await resolveCameraId();
 
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            deviceId: { exact: cameraId },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 }
-          },
-          audio: false
-        });
+        codeReader = new ZXing.BrowserMultiFormatReader();
+        
+        controls = await codeReader.decodeFromVideoDevice(
+          cameraId,
+          videoEl,
+          async (result, err) => {
+            
+            if (result) {
+              const text = String(result.getText()).trim();
+              if (!text || sending) return;
+              
+              setStatus(`スキャン成功: ${text}`);
+              await stop();
+              sendResult(text);
+              return;
+            }
+            
+            if (!result && !sending) {
+              tryRotatedFallbackScan();
+            }
+          
+          }
+        );
 
-        videoEl.srcObject = stream;
-        await videoEl.play();
+        stream = videoEl.srcObject instanceof MediaStream ? videoEl.srcObject : null;
 
+        startRotatedFallbackLoop();
         setupZoomUI();
-        startScanLoop();
         setStatus("バーコードを枠内に合わせてください");
       } catch (e) {
         setStatus(
