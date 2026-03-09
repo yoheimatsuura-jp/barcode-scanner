@@ -81,6 +81,10 @@
 		let zoomSupported = false;
 		let zoomApplyTimer = null;
 
+		let rotatedScanTimer = null;
+		let rotatedScanBusy = false;
+		let detector = null;
+
 		function isPortrait() {
 			return window.innerHeight >= window.innerWidth;
 		}
@@ -145,6 +149,11 @@
 		}
 
 		async function stop() {
+			if (rotatedScanTimer) {
+				clearInterval(rotatedScanTimer);
+				rotatedScanTimer = null;
+			}
+			
 			if (!qr) return;
 			try {
 				if (qr.isScanning) await qr.stop();
@@ -152,7 +161,7 @@
 			try {
 				await qr.clear();
 			} catch (_) {}
-
+			
 			zoomWrap.style.display = "none";
 			zoomSupported = false;
 		}
@@ -265,6 +274,140 @@
 			zoomApplyTimer = setTimeout(() => applyZoom(v), 60);
 		});
 
+		function getVideoEl() {
+			const root = document.getElementById("reader");
+			if (!root) return null;
+			return root.querySelector("video");
+		}
+		
+		function ensureDetector() {
+			if (!("BarcodeDetector" in window)) return null;
+			if (detector) return detector;
+			
+			try {
+				detector = new BarcodeDetector({
+					formats: [
+						"ean_13",
+						"ean_8",
+						"upc_a",
+						"upc_e",
+						"code_128",
+						"code_39",
+						"itf"
+					]
+				});
+				return detector;
+			} catch (_) {
+				return null;
+			}
+		}
+		
+		function drawVideoFrameToCanvas(video, rotateDeg = 0) {
+			const vw = video.videoWidth || 0;
+			const vh = video.videoHeight || 0;
+			if (!vw || !vh) return null;
+			
+			const canvas = document.createElement("canvas");
+			const ctx = canvas.getContext("2d", { willReadFrequently: true });
+			if (!ctx) return null;
+			
+			if (rotateDeg === 90 || rotateDeg === 270) {
+				canvas.width = vh;
+				canvas.height = vw;
+			} else {
+				canvas.width = vw;
+				canvas.height = vh;
+			}
+			
+			if (rotateDeg === 0) {
+				ctx.drawImage(video, 0, 0, vw, vh);
+			} else if (rotateDeg === 90) {
+				ctx.translate(canvas.width, 0);
+				ctx.rotate(Math.PI / 2);
+				ctx.drawImage(video, 0, 0, vw, vh);
+			} else if (rotateDeg === 270) {
+				ctx.translate(0, canvas.height);
+				ctx.rotate(-Math.PI / 2);
+				ctx.drawImage(video, 0, 0, vw, vh);
+			} else if (rotateDeg === 180) {
+				ctx.translate(canvas.width, canvas.height);
+				ctx.rotate(Math.PI);
+				ctx.drawImage(video, 0, 0, vw, vh);
+			}
+			
+			return canvas;
+		}
+		
+		async function detectBarcodeFromCanvas(canvas) {
+			const d = ensureDetector();
+			if (!d || !canvas) return "";
+			
+			try {
+				const results = await d.detect(canvas);
+				if (!results || !results.length) return "";
+				
+				const raw = results.find(r => r && r.rawValue);
+				return raw ? String(raw.rawValue).trim() : "";
+			} catch (_) {
+				return "";
+			}
+		}
+		
+		async function tryRotatedFallbackScan() {
+			if (rotatedScanBusy || sending) return;
+			
+			const d = ensureDetector();
+			if (!d) return;
+			
+			const video = getVideoEl();
+			if (!video) return;
+			if (video.readyState < 2) return;
+			
+			rotatedScanBusy = true;
+			try {
+				// まず通常向き
+				let canvas = drawVideoFrameToCanvas(video, 0);
+				let code = await detectBarcodeFromCanvas(canvas);
+				if (code) {
+					setStatus(`スキャン成功: ${code}`);
+					try { await stop(); } catch (_) {}
+					sendResult(code);
+					return;
+				}
+				
+				// 縦向き対策：90度
+				canvas = drawVideoFrameToCanvas(video, 90);
+				code = await detectBarcodeFromCanvas(canvas);
+				if (code) {
+					setStatus(`スキャン成功: ${code}`);
+					try { await stop(); } catch (_) {}
+					sendResult(code);
+					return;
+				}
+				
+				// 縦向き対策：270度
+				canvas = drawVideoFrameToCanvas(video, 270);
+				code = await detectBarcodeFromCanvas(canvas);
+				if (code) {
+					setStatus(`スキャン成功: ${code}`);
+					try { await stop(); } catch (_) {}
+					sendResult(code);
+					return;
+				}
+			} finally {
+				rotatedScanBusy = false;
+			}
+		}
+		
+		function startRotatedFallbackLoop() {
+			if (rotatedScanTimer) clearInterval(rotatedScanTimer);
+			
+			// 0.5秒ごとに補助判定
+			rotatedScanTimer = setInterval(() => {
+				tryRotatedFallbackScan();
+			}, 500);
+		}
+
 		async function start() {
 			if (busy) return;
 			busy = true;
@@ -301,6 +444,7 @@
 					() => {}
 				);
 
+				startRotatedFallbackLoop();
 				setupZoomUI();
 				setStatus("バーコードを横長の枠内に合わせてください");
 			} catch (e) {
